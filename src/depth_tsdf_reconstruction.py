@@ -1,7 +1,14 @@
 """
-Phase 1: Depth-only Ground Truth Reconstruction
+Phase 1: Depth-only Ground Truth Reconstruction with Robust ICP Odometry
 Generates absolute-scale 3D model from depth images using TSDF fusion.
 This serves as the ground truth for SFM scale alignment.
+
+Features:
+- Robust point-to-plane ICP for accurate odometry
+- Optional undistortion for depth images
+- Fitness and RMSE reporting per frame
+- Proper camera pose accumulation
+- Highly configurable parameters
 """
 import numpy as np
 import cv2
@@ -20,63 +27,265 @@ except ImportError:
     HAS_OPEN3D = False
 
 
+def create_undistortion_map(K: np.ndarray, D: np.ndarray, width: int, height: int) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Create undistortion maps for depth image rectification.
+
+    Args:
+        K: Camera intrinsic matrix (3x3)
+        D: Distortion coefficients
+        width: Image width
+        height: Image height
+
+    Returns:
+        (map1, map2): Undistortion maps for cv2.remap
+    """
+    # Use the same K for both input and output (preserve field of view)
+    map1, map2 = cv2.initUndistortRectifyMap(
+        K, D, None, K, (width, height), cv2.CV_32FC1
+    )
+    return map1, map2
+
+
+def undistort_depth_image(depth: np.ndarray, map1: np.ndarray, map2: np.ndarray) -> np.ndarray:
+    """
+    Apply undistortion to depth image.
+
+    Args:
+        depth: Depth image
+        map1, map2: Undistortion maps from create_undistortion_map
+
+    Returns:
+        Undistorted depth image
+    """
+    return cv2.remap(depth, map1, map2, cv2.INTER_NEAREST)
+
+
+def depth_to_pointcloud(
+    depth: np.ndarray,
+    K: np.ndarray,
+    rgb: Optional[np.ndarray] = None,
+    depth_scale: float = 1.0,
+    depth_trunc: float = 10.0
+) -> o3d.geometry.PointCloud:
+    """
+    Convert depth image to Open3D point cloud.
+
+    Args:
+        depth: Depth image in meters
+        K: Camera intrinsic matrix
+        rgb: Optional RGB image for coloring
+        depth_scale: Depth scale factor (not used if depth already in meters)
+        depth_trunc: Maximum depth value to consider
+
+    Returns:
+        Open3D PointCloud
+    """
+    h, w = depth.shape
+    fx, fy = K[0, 0], K[1, 1]
+    cx, cy = K[0, 2], K[1, 2]
+
+    # Create coordinate grids
+    u, v = np.meshgrid(np.arange(w), np.arange(h))
+    u = u.flatten().astype(np.float32)
+    v = v.flatten().astype(np.float32)
+    z = depth.flatten().astype(np.float32)
+
+    # Filter valid depths
+    valid = (z > 0) & (z < depth_trunc)
+    u, v, z = u[valid], v[valid], z[valid]
+
+    # Backproject to 3D
+    x = (u - cx) * z / fx
+    y = (v - cy) * z / fy
+
+    points = np.stack([x, y, z], axis=-1)
+
+    # Create point cloud
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points)
+
+    # Add colors if RGB provided
+    if rgb is not None:
+        colors = rgb.reshape(-1, 3)[valid] / 255.0
+        pcd.colors = o3d.utility.Vector3dVector(colors)
+
+    return pcd
+
+
+def robust_icp(
+    source_pcd: o3d.geometry.PointCloud,
+    target_pcd: o3d.geometry.PointCloud,
+    initial_transform: np.ndarray,
+    voxel_size: float = 0.02,
+    max_correspondence_distance: float = 0.05,
+    max_iterations: int = 50
+) -> Tuple[np.ndarray, float, float]:
+    """
+    Robust point-to-plane ICP registration.
+
+    Args:
+        source_pcd: Source point cloud (current frame)
+        target_pcd: Target point cloud (previous frame)
+        initial_transform: Initial transformation guess (4x4)
+        voxel_size: Voxel size for downsampling
+        max_correspondence_distance: Max distance for point correspondence
+        max_iterations: Maximum ICP iterations
+
+    Returns:
+        (transformation, fitness, rmse): 4x4 transformation matrix, fitness score, and RMSE
+    """
+    # Downsample for efficiency
+    source_down = source_pcd.voxel_down_sample(voxel_size)
+    target_down = target_pcd.voxel_down_sample(voxel_size)
+
+    # Estimate normals for point-to-plane ICP
+    source_down.estimate_normals(
+        search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size * 2, max_nn=30)
+    )
+    target_down.estimate_normals(
+        search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size * 2, max_nn=30)
+    )
+
+    # Point-to-plane ICP
+    reg_result = o3d.pipelines.registration.registration_icp(
+        source_down,
+        target_down,
+        max_correspondence_distance,
+        initial_transform,
+        o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+        o3d.pipelines.registration.ICPConvergenceCriteria(
+            max_iteration=max_iterations
+        )
+    )
+
+    return reg_result.transformation, reg_result.fitness, reg_result.inlier_rmse
+
+
 class DepthTSDFReconstructor:
-    """TSDF-based depth reconstruction for ground truth generation"""
+    """TSDF-based depth reconstruction with robust odometry"""
 
     def __init__(
         self,
-        voxel_length: float = 0.01,  # 1cm voxels
-        sdf_trunc: float = 0.04,     # 4cm truncation
-        depth_scale: float = 1000.0,  # mm to m
-        depth_trunc: float = 10.0,    # max depth 10m
+        tsdf_voxel_length: float = 0.01,     # 1cm TSDF voxels
+        tsdf_trunc_factor: float = 4.0,       # Truncation = voxel_length * factor
+        depth_scale: float = 1.0,             # 1.0 for meters, 1000.0 for mm->m conversion
+        depth_trunc: float = 10.0,            # Max depth 10m
+        icp_voxel_size: float = 0.02,         # 2cm voxels for ICP downsampling
+        icp_max_corr_dist: float = 0.05,      # 5cm max correspondence distance
+        use_undistortion: bool = False,       # Enable depth undistortion
+        K: Optional[np.ndarray] = None,       # Required if use_undistortion=True
+        D: Optional[np.ndarray] = None,       # Required if use_undistortion=True
+        width: int = 512,                     # Depth image width
+        height: int = 512,                    # Depth image height
     ):
         """
-        Initialize TSDF reconstructor.
+        Initialize TSDF reconstructor with robust odometry.
 
         Args:
-            voxel_length: Voxel size in meters
-            sdf_trunc: SDF truncation distance in meters
-            depth_scale: Depth scale (1000 for mm->m, 1 for m->m)
+            tsdf_voxel_length: TSDF voxel size in meters
+            tsdf_trunc_factor: Truncation distance = voxel_length * factor
+            depth_scale: Depth scale (1.0 for meters, 1000.0 for mm)
             depth_trunc: Maximum valid depth in meters
+            icp_voxel_size: Voxel size for ICP downsampling
+            icp_max_corr_dist: Maximum correspondence distance for ICP
+            use_undistortion: Whether to undistort depth images
+            K: Camera intrinsic matrix (required if undistortion enabled)
+            D: Distortion coefficients (required if undistortion enabled)
+            width: Depth image width
+            height: Depth image height
         """
         if not HAS_OPEN3D:
             raise ImportError("Open3D is required for TSDF reconstruction")
 
-        self.voxel_length = voxel_length
-        self.sdf_trunc = sdf_trunc
+        self.tsdf_voxel_length = tsdf_voxel_length
+        self.tsdf_trunc = tsdf_voxel_length * tsdf_trunc_factor
         self.depth_scale = depth_scale
         self.depth_trunc = depth_trunc
+        self.icp_voxel_size = icp_voxel_size
+        self.icp_max_corr_dist = icp_max_corr_dist
+        self.use_undistortion = use_undistortion
 
         # Create TSDF volume
         self.volume = o3d.pipelines.integration.ScalableTSDFVolume(
-            voxel_length=voxel_length,
-            sdf_trunc=sdf_trunc,
+            voxel_length=tsdf_voxel_length,
+            sdf_trunc=self.tsdf_trunc,
             color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8
         )
 
-        self.trajectory = []  # Store poses for later use
+        # Odometry state
+        self.T_world_cam = np.eye(4)  # Current camera pose in world frame
+        self.prev_pcd = None          # Previous frame point cloud for ICP
+        self.trajectory = []          # Store all poses
+        self.odometry_log = []        # Store ICP fitness/RMSE per frame
+
+        # Undistortion maps
+        self.undist_map1 = None
+        self.undist_map2 = None
+        if use_undistortion:
+            if K is None or D is None:
+                raise ValueError("K and D must be provided when use_undistortion=True")
+            self.undist_map1, self.undist_map2 = create_undistortion_map(K, D, width, height)
+            logger.info("Created undistortion maps for depth images")
 
     def integrate_frame(
         self,
         rgb_img: np.ndarray,
         depth_img: np.ndarray,
         K: np.ndarray,
-        pose: np.ndarray,
-        frame_id: str
-    ):
+        frame_id: str,
+        use_icp: bool = True
+    ) -> Dict:
         """
-        Integrate one RGB-D frame into TSDF volume.
+        Integrate one RGB-D frame into TSDF volume with odometry.
 
         Args:
             rgb_img: RGB image (H, W, 3), uint8
             depth_img: Depth image (H, W), float32 in meters
             K: Camera intrinsic matrix (3, 3)
-            pose: Camera pose (4, 4), world-to-camera transform
             frame_id: Frame identifier
+            use_icp: Whether to use ICP for pose estimation
+
+        Returns:
+            Dictionary with odometry statistics
         """
         h, w = depth_img.shape
 
-        # Convert depth to Open3D format
+        # Apply undistortion if enabled
+        if self.use_undistortion:
+            depth_img = undistort_depth_image(depth_img, self.undist_map1, self.undist_map2)
+
+        # Convert to point cloud for ICP
+        current_pcd = depth_to_pointcloud(
+            depth_img, K, rgb_img, self.depth_scale, self.depth_trunc
+        )
+
+        # Estimate camera pose using ICP
+        fitness, rmse = 0.0, 0.0
+        if use_icp and self.prev_pcd is not None:
+            try:
+                # Run ICP to get relative transformation from previous to current
+                T_prev_to_curr, fitness, rmse = robust_icp(
+                    current_pcd,
+                    self.prev_pcd,
+                    initial_transform=np.eye(4),  # Identity as initial guess
+                    voxel_size=self.icp_voxel_size,
+                    max_correspondence_distance=self.icp_max_corr_dist
+                )
+
+                # Update world pose: T_world_cam = T_world_cam @ T_prev_to_curr
+                self.T_world_cam = self.T_world_cam @ T_prev_to_curr
+
+                logger.debug(f"ICP for {frame_id}: fitness={fitness:.3f}, RMSE={rmse:.4f}m")
+
+            except Exception as e:
+                logger.warning(f"ICP failed for {frame_id}: {e}. Using identity transform.")
+                fitness, rmse = 0.0, 0.0
+        else:
+            # First frame or ICP disabled - keep current pose
+            logger.debug(f"Frame {frame_id}: No ICP (first frame or disabled)")
+
+        # Convert depth to Open3D format for TSDF integration
         # Open3D expects depth in depth_scale units (e.g., mm if scale=1000)
         depth_o3d = (depth_img * self.depth_scale).astype(np.uint16)
 
@@ -103,20 +312,35 @@ class DepthTSDFReconstructor:
             cy=K[1, 2]
         )
 
-        # Integrate into volume
+        # Integrate into TSDF volume
         # Open3D expects camera-to-world pose (inverse of world-to-camera)
-        extrinsic = np.linalg.inv(pose)
+        T_cam_world = np.linalg.inv(self.T_world_cam)
+        self.volume.integrate(rgbd, intrinsic, T_cam_world)
 
-        self.volume.integrate(rgbd, intrinsic, extrinsic)
-
-        # Store trajectory
+        # Store trajectory and odometry log
         self.trajectory.append({
             'frame_id': frame_id,
-            'pose': pose.tolist(),
-            'extrinsic': extrinsic.tolist()
+            'T_world_cam': self.T_world_cam.tolist(),
+            'T_cam_world': T_cam_world.tolist()
         })
 
-        logger.debug(f"Integrated frame {frame_id}")
+        self.odometry_log.append({
+            'frame_id': frame_id,
+            'fitness': float(fitness),
+            'rmse': float(rmse),
+            'translation_norm': float(np.linalg.norm(self.T_world_cam[:3, 3]))
+        })
+
+        # Update previous point cloud
+        self.prev_pcd = current_pcd
+
+        logger.debug(f"Integrated frame {frame_id}, pose translation: {self.T_world_cam[:3, 3]}")
+
+        return {
+            'fitness': fitness,
+            'rmse': rmse,
+            'num_points': len(current_pcd.points)
+        }
 
     def extract_mesh(self) -> o3d.geometry.TriangleMesh:
         """Extract triangle mesh from TSDF volume"""
@@ -124,10 +348,10 @@ class DepthTSDFReconstructor:
         mesh.compute_vertex_normals()
         return mesh
 
-    def extract_point_cloud(self) -> o3d.geometry.PointCloud:
+    def extract_point_cloud(self, num_points: int = 500000) -> o3d.geometry.PointCloud:
         """Extract point cloud from TSDF volume"""
         mesh = self.extract_mesh()
-        pcd = mesh.sample_points_uniformly(number_of_points=100000)
+        pcd = mesh.sample_points_uniformly(number_of_points=num_points)
         return pcd
 
     def save_results(self, output_dir: str):
@@ -145,7 +369,7 @@ class DepthTSDFReconstructor:
         mesh = self.extract_mesh()
         mesh_path = output_path / 'fused_mesh.ply'
         o3d.io.write_triangle_mesh(str(mesh_path), mesh)
-        logger.info(f"Saved mesh: {mesh_path}")
+        logger.info(f"Saved mesh: {mesh_path} ({len(mesh.vertices)} vertices)")
 
         # Extract and save point cloud
         logger.info("Extracting point cloud...")
@@ -160,11 +384,29 @@ class DepthTSDFReconstructor:
             json.dump(self.trajectory, f, indent=2)
         logger.info(f"Saved trajectory: {trajectory_path}")
 
+        # Save odometry log
+        odometry_log_path = output_path / 'odometry_log.json'
+        with open(odometry_log_path, 'w') as f:
+            json.dump(self.odometry_log, f, indent=2)
+
+        # Compute statistics
+        if len(self.odometry_log) > 1:
+            fitnesses = [log['fitness'] for log in self.odometry_log[1:]]  # Skip first frame
+            rmses = [log['rmse'] for log in self.odometry_log[1:]]
+            mean_fitness = np.mean(fitnesses) if fitnesses else 0.0
+            mean_rmse = np.mean(rmses) if rmses else 0.0
+            logger.info(f"Odometry statistics: Mean fitness={mean_fitness:.3f}, Mean RMSE={mean_rmse:.4f}m")
+
+        logger.info(f"Saved odometry log: {odometry_log_path}")
+
         return {
             'mesh_path': str(mesh_path),
             'pcd_path': str(pcd_path),
             'trajectory_path': str(trajectory_path),
-            'num_points': len(pcd.points)
+            'odometry_log_path': str(odometry_log_path),
+            'num_vertices': len(mesh.vertices),
+            'num_points': len(pcd.points),
+            'num_frames': len(self.trajectory)
         }
 
 
@@ -172,20 +414,34 @@ def run_depth_reconstruction(
     rgb_depth_pairs: List[Tuple[str, str, str]],
     depth_K: np.ndarray,
     output_dir: str = 'output_depth_tsdf',
-    voxel_length: float = 0.01,
+    tsdf_voxel_size: float = 0.01,
+    tsdf_trunc_factor: float = 4.0,
     depth_unit: str = 'mm',
-    use_icp: bool = False
+    use_icp: bool = True,
+    icp_voxel_size: float = 0.02,
+    icp_max_corr_dist: float = 0.05,
+    use_undistortion: bool = False,
+    depth_D: Optional[np.ndarray] = None,
+    depth_width: int = 512,
+    depth_height: int = 512
 ) -> Dict:
     """
-    Run depth-only TSDF reconstruction.
+    Run depth-only TSDF reconstruction with robust ICP odometry.
 
     Args:
         rgb_depth_pairs: List of (rgb_path, depth_path, pair_id)
         depth_K: Depth camera intrinsic matrix
         output_dir: Output directory
-        voxel_length: Voxel size in meters
+        tsdf_voxel_size: TSDF voxel size in meters
+        tsdf_trunc_factor: TSDF truncation distance = voxel_size * factor
         depth_unit: Depth unit ('m' or 'mm')
-        use_icp: Whether to use ICP for pose refinement
+        use_icp: Whether to use ICP for pose estimation
+        icp_voxel_size: Voxel size for ICP downsampling
+        icp_max_corr_dist: Maximum correspondence distance for ICP
+        use_undistortion: Whether to undistort depth images
+        depth_D: Depth distortion coefficients (required if use_undistortion=True)
+        depth_width: Depth image width
+        depth_height: Depth image height
 
     Returns:
         Dictionary with reconstruction results
@@ -197,185 +453,148 @@ def run_depth_reconstruction(
 
     # Initialize reconstructor
     reconstructor = DepthTSDFReconstructor(
-        voxel_length=voxel_length,
-        sdf_trunc=voxel_length * 4,
+        tsdf_voxel_length=tsdf_voxel_size,
+        tsdf_trunc_factor=tsdf_trunc_factor,
         depth_scale=depth_scale,
-        depth_trunc=10.0
+        depth_trunc=10.0,
+        icp_voxel_size=icp_voxel_size,
+        icp_max_corr_dist=icp_max_corr_dist,
+        use_undistortion=use_undistortion,
+        K=depth_K if use_undistortion else None,
+        D=depth_D if use_undistortion else None,
+        width=depth_width,
+        height=depth_height
     )
 
+    logger.info("=" * 80)
     logger.info(f"Starting depth reconstruction with {len(rgb_depth_pairs)} frames")
-    logger.info(f"Voxel size: {voxel_length*100:.1f}cm, Depth unit: {depth_unit}")
-
-    # Simple trajectory: assume sequential capture with small motion
-    # For better results, use ICP or visual odometry
-    poses = []
+    logger.info(f"TSDF voxel size: {tsdf_voxel_size*100:.1f}cm")
+    logger.info(f"TSDF truncation: {tsdf_voxel_size*tsdf_trunc_factor*100:.1f}cm")
+    logger.info(f"Depth unit: {depth_unit}")
+    logger.info(f"ICP enabled: {use_icp}")
+    if use_icp:
+        logger.info(f"ICP voxel size: {icp_voxel_size*100:.1f}cm")
+        logger.info(f"ICP max correspondence: {icp_max_corr_dist*100:.1f}cm")
+    logger.info(f"Undistortion enabled: {use_undistortion}")
+    logger.info("=" * 80)
 
     for idx, (rgb_path, depth_path, pair_id) in enumerate(rgb_depth_pairs):
         # Load images
         rgb_img = cv2.imread(rgb_path)
+        if rgb_img is None:
+            logger.warning(f"Failed to load RGB image: {rgb_path}")
+            continue
         rgb_img = cv2.cvtColor(rgb_img, cv2.COLOR_BGR2RGB)
 
-        depth_img = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED).astype(np.float32)
+        depth_img = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
+        if depth_img is None:
+            logger.warning(f"Failed to load depth image: {depth_path}")
+            continue
+        depth_img = depth_img.astype(np.float32)
 
         # Convert depth to meters
         if depth_unit == 'mm':
             depth_img = depth_img / 1000.0
 
-        # Initialize pose (identity for first frame, then ICP if enabled)
-        if idx == 0:
-            pose = np.eye(4)
-        else:
-            if use_icp and idx > 0:
-                # Use ICP between consecutive depth frames
-                pose = run_depth_icp(
-                    prev_depth, depth_img,
-                    prev_rgb, rgb_img,
-                    depth_K, poses[-1]
-                )
-            else:
-                # Simple incremental pose (assume small motion)
-                # This is a placeholder - real implementation needs odometry
-                pose = np.eye(4)
-                pose[2, 3] = idx * 0.1  # Move 10cm forward each frame
-
-        poses.append(pose)
-
-        # Integrate frame
-        reconstructor.integrate_frame(
-            rgb_img, depth_img, depth_K, pose, pair_id
+        # Integrate frame with ICP odometry
+        stats = reconstructor.integrate_frame(
+            rgb_img, depth_img, depth_K, pair_id, use_icp=use_icp
         )
 
-        logger.info(f"Integrated frame {idx+1}/{len(rgb_depth_pairs)}: {pair_id}")
-
-        prev_depth = depth_img
-        prev_rgb = rgb_img
+        logger.info(
+            f"Frame {idx+1}/{len(rgb_depth_pairs)}: {pair_id} | "
+            f"Points: {stats['num_points']} | "
+            f"Fitness: {stats['fitness']:.3f} | "
+            f"RMSE: {stats['rmse']:.4f}m"
+        )
 
     # Save results
+    logger.info("=" * 80)
     logger.info("Saving reconstruction results...")
     results = reconstructor.save_results(output_dir)
 
     logger.info("=" * 80)
     logger.info("Depth reconstruction completed!")
     logger.info(f"Output directory: {output_dir}")
+    logger.info(f"Mesh: {results['num_vertices']} vertices")
     logger.info(f"Point cloud: {results['num_points']} points")
+    logger.info(f"Frames integrated: {results['num_frames']}")
     logger.info("=" * 80)
 
     return results
 
 
-def run_depth_icp(
-    source_depth: np.ndarray,
-    target_depth: np.ndarray,
-    source_rgb: np.ndarray,
-    target_rgb: np.ndarray,
-    K: np.ndarray,
-    initial_pose: np.ndarray
-) -> np.ndarray:
-    """
-    Run ICP between two depth frames for pose estimation.
-
-    Args:
-        source_depth: Source depth image
-        target_depth: Target depth image
-        source_rgb: Source RGB image
-        target_rgb: Target RGB image
-        K: Camera intrinsic matrix
-        initial_pose: Initial pose guess
-
-    Returns:
-        Refined pose (4x4 matrix)
-    """
-    # Convert depth to point clouds
-    def depth_to_pcd(depth, rgb, K):
-        h, w = depth.shape
-        fx, fy = K[0, 0], K[1, 1]
-        cx, cy = K[0, 2], K[1, 2]
-
-        u, v = np.meshgrid(np.arange(w), np.arange(h))
-        u = u.flatten()
-        v = v.flatten()
-        z = depth.flatten()
-
-        valid = z > 0
-        u, v, z = u[valid], v[valid], z[valid]
-
-        x = (u - cx) * z / fx
-        y = (v - cy) * z / fy
-
-        points = np.stack([x, y, z], axis=-1)
-        colors = rgb.reshape(-1, 3)[valid] / 255.0
-
-        pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(points)
-        pcd.colors = o3d.utility.Vector3dVector(colors)
-
-        return pcd
-
-    source_pcd = depth_to_pcd(source_depth, source_rgb, K)
-    target_pcd = depth_to_pcd(target_depth, target_rgb, K)
-
-    # Downsample for speed
-    source_pcd = source_pcd.voxel_down_sample(voxel_size=0.02)
-    target_pcd = target_pcd.voxel_down_sample(voxel_size=0.02)
-
-    # Estimate normals
-    source_pcd.estimate_normals()
-    target_pcd.estimate_normals()
-
-    # Run ICP
-    threshold = 0.05  # 5cm
-    reg_result = o3d.pipelines.registration.registration_icp(
-        source_pcd, target_pcd, threshold, initial_pose,
-        o3d.pipelines.registration.TransformationEstimationPointToPlane()
-    )
-
-    return reg_result.transformation
-
-
 if __name__ == '__main__':
-    # Test
+    # Test and CLI
     import argparse
     import sys
     from .utils import find_rgb_depth_pairs, setup_logging
     from .calib_io import load_camera_info
 
-    parser = argparse.ArgumentParser(description='Depth-only TSDF reconstruction')
+    parser = argparse.ArgumentParser(description='Depth-only TSDF reconstruction with robust ICP odometry')
     parser.add_argument('--rgb-dir', required=True, help='RGB images directory')
     parser.add_argument('--depth-dir', required=True, help='Depth images directory')
     parser.add_argument('--calib', required=True, help='Depth camera calibration JSON')
     parser.add_argument('--output-dir', default='output_depth_tsdf', help='Output directory')
-    parser.add_argument('--voxel-size', type=float, default=0.01, help='Voxel size in meters')
-    parser.add_argument('--depth-unit', choices=['m', 'mm'], default='mm', help='Depth unit')
-    parser.add_argument('--use-icp', action='store_true', help='Use ICP for pose estimation')
+
+    # TSDF parameters
+    parser.add_argument('--tsdf-voxel', type=float, default=0.01, help='TSDF voxel size in meters (default: 0.01)')
+    parser.add_argument('--tsdf-trunc-factor', type=float, default=4.0, help='TSDF truncation factor (default: 4.0)')
+
+    # Depth parameters
+    parser.add_argument('--depth-unit', choices=['m', 'mm'], default='mm', help='Depth unit (default: mm)')
+
+    # ICP parameters
+    parser.add_argument('--use-icp', action='store_true', help='Enable ICP for pose estimation')
+    parser.add_argument('--icp-voxel', type=float, default=0.02, help='ICP voxel size for downsampling (default: 0.02)')
+    parser.add_argument('--icp-max-corr', type=float, default=0.05, help='ICP max correspondence distance (default: 0.05)')
+
+    # Undistortion
+    parser.add_argument('--undistort', action='store_true', help='Enable depth undistortion')
+
+    # Logging
+    parser.add_argument('--log-level', default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'])
 
     args = parser.parse_args()
 
-    setup_logging('INFO')
+    setup_logging(args.log_level)
 
     try:
         # Load calibration
         calib = load_camera_info(args.calib)
+        logger.info(f"Loaded calibration: {calib}")
 
-        # Find pairs
+        # Find RGB-Depth pairs
         pairs = find_rgb_depth_pairs(args.rgb_dir, args.depth_dir)
 
         if not pairs:
             logger.error("No RGB-Depth pairs found!")
             sys.exit(1)
 
+        logger.info(f"Found {len(pairs)} RGB-Depth pairs")
+
         # Run reconstruction
         results = run_depth_reconstruction(
             pairs,
             calib.K,
             output_dir=args.output_dir,
-            voxel_length=args.voxel_size,
+            tsdf_voxel_size=args.tsdf_voxel,
+            tsdf_trunc_factor=args.tsdf_trunc_factor,
             depth_unit=args.depth_unit,
-            use_icp=args.use_icp
+            use_icp=args.use_icp,
+            icp_voxel_size=args.icp_voxel,
+            icp_max_corr_dist=args.icp_max_corr,
+            use_undistortion=args.undistort,
+            depth_D=calib.D if args.undistort else None,
+            depth_width=calib.width,
+            depth_height=calib.height
         )
 
         print(f"\n✅ Reconstruction complete!")
-        print(f"   Point cloud: {results['pcd_path']}")
-        print(f"   Points: {results['num_points']}")
+        print(f"   Mesh: {results['mesh_path']} ({results['num_vertices']} vertices)")
+        print(f"   Point cloud: {results['pcd_path']} ({results['num_points']} points)")
+        print(f"   Trajectory: {results['trajectory_path']}")
+        print(f"   Odometry log: {results['odometry_log_path']}")
 
     except Exception as e:
         logger.error(f"Reconstruction failed: {e}", exc_info=True)

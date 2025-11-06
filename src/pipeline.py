@@ -261,18 +261,29 @@ class Pipeline:
 
             # Get reconstruction config
             depth_config = self.config.get('depth_reconstruction', {})
-            voxel_size = depth_config.get('voxel_size_m', 0.01)
+            tsdf_voxel_size = depth_config.get('tsdf_voxel_size', 0.01)
+            tsdf_trunc_factor = depth_config.get('tsdf_trunc_factor', 4.0)
             depth_unit = depth_config.get('depth_unit', 'auto')
-            use_icp = depth_config.get('use_icp', False)
+            use_icp = depth_config.get('use_icp', True)
+            icp_voxel_size = depth_config.get('icp_voxel_size', 0.02)
+            icp_max_corr_dist = depth_config.get('icp_max_corr_dist', 0.05)
+            use_undistortion = depth_config.get('use_undistortion', False)
 
             # Run reconstruction
             results = run_depth_reconstruction(
                 pairs,
                 self.depth_calib.K,
                 output_dir=output_dir,
-                voxel_length=voxel_size,
+                tsdf_voxel_size=tsdf_voxel_size,
+                tsdf_trunc_factor=tsdf_trunc_factor,
                 depth_unit=depth_unit,
-                use_icp=use_icp
+                use_icp=use_icp,
+                icp_voxel_size=icp_voxel_size,
+                icp_max_corr_dist=icp_max_corr_dist,
+                use_undistortion=use_undistortion,
+                depth_D=self.depth_calib.D if use_undistortion else None,
+                depth_width=self.depth_calib.width,
+                depth_height=self.depth_calib.height
             )
 
             logger.info(f"Depth reconstruction complete:")
