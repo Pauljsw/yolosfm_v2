@@ -265,54 +265,161 @@ def match_point_clouds_fpfh(
     return source_points, target_points
 
 
+def extract_frame_id_from_filename(filename: str) -> Optional[str]:
+    """
+    Extract frame ID from RGB filename.
+
+    Example: "camera_RGB_1758853283_533442048.png" → "1758853283_533442048"
+
+    Args:
+        filename: Image filename
+
+    Returns:
+        Frame ID string or None if not matched
+    """
+    import re
+    match = re.match(r'camera_RGB_(\d+_\d+)', filename)
+    if match:
+        return match.group(1)
+    return None
+
+
+def match_trajectory_and_poses(
+    depth_trajectory: List[Dict],
+    sfm_poses: Dict
+) -> Tuple[List[np.ndarray], List[np.ndarray]]:
+    """
+    Match camera positions between depth trajectory and SFM poses.
+
+    Args:
+        depth_trajectory: List of dicts with 'frame_id' and 'T_world_cam'
+        sfm_poses: Dict of {filename: {'R': ..., 't': ...}}
+
+    Returns:
+        (depth_camera_centers, sfm_camera_centers) as lists of (3,) arrays
+    """
+    depth_centers = []
+    sfm_centers = []
+    matched_count = 0
+
+    # Build frame_id → SFM pose mapping
+    sfm_frame_map = {}
+    for img_name, pose_data in sfm_poses.items():
+        filename = pose_data.get('filename', img_name)
+        frame_id = extract_frame_id_from_filename(filename)
+        if frame_id:
+            sfm_frame_map[frame_id] = pose_data
+
+    # Match trajectories
+    for traj_item in depth_trajectory:
+        frame_id = traj_item['frame_id']
+
+        if frame_id in sfm_frame_map:
+            # Extract depth camera center from T_world_cam
+            T_world_cam = np.array(traj_item['T_world_cam'])
+            depth_center = T_world_cam[:3, 3]  # Translation part
+
+            # Extract SFM camera center from R, t
+            sfm_pose = sfm_frame_map[frame_id]
+            R = np.array(sfm_pose['R'])
+            t = np.array(sfm_pose['t']).reshape(3)
+            sfm_center = -R.T @ t  # Camera center in world coordinates
+
+            depth_centers.append(depth_center)
+            sfm_centers.append(sfm_center)
+            matched_count += 1
+
+    logger.info(f"Matched {matched_count} camera frames (from {len(depth_trajectory)} depth, {len(sfm_poses)} SFM)")
+
+    if matched_count < 3:
+        raise ValueError(f"Insufficient matched frames: {matched_count}, need at least 3")
+
+    return np.array(depth_centers), np.array(sfm_centers)
+
+
 def align_sfm_to_depth_groundtruth(
     sfm_sparse_points: np.ndarray,
     depth_gt_pointcloud: np.ndarray,
+    sfm_poses: Optional[Dict] = None,
+    depth_trajectory: Optional[List[Dict]] = None,
+    use_camera_trajectory: bool = True,
     use_feature_matching: bool = True,
     max_points: int = 10000
 ) -> Dict:
     """
     Align SFM sparse reconstruction to depth ground truth.
 
+    Tries methods in order:
+    1. Camera trajectory alignment (most reliable if available)
+    2. FPFH feature matching
+    3. Error - no fallback to bad centroid matching
+
     Args:
         sfm_sparse_points: SFM sparse points (N, 3)
         depth_gt_pointcloud: Depth ground truth points (M, 3)
-        use_feature_matching: Whether to use FPFH feature matching
+        sfm_poses: SFM poses dict (required if use_camera_trajectory=True)
+        depth_trajectory: Depth trajectory list (required if use_camera_trajectory=True)
+        use_camera_trajectory: Try camera trajectory alignment first
+        use_feature_matching: Try FPFH feature matching
         max_points: Maximum points to use for alignment
 
     Returns:
         Dictionary with scale, rotation, translation
     """
-    # Subsample if too many points
-    if len(sfm_sparse_points) > max_points:
-        indices = np.random.choice(len(sfm_sparse_points), max_points, replace=False)
-        sfm_sparse_points = sfm_sparse_points[indices]
+    source_corr = None
+    target_corr = None
+    alignment_method = "unknown"
 
-    if len(depth_gt_pointcloud) > max_points:
-        indices = np.random.choice(len(depth_gt_pointcloud), max_points, replace=False)
-        depth_gt_pointcloud = depth_gt_pointcloud[indices]
+    # Method 1: Camera trajectory alignment (BEST)
+    if use_camera_trajectory and sfm_poses is not None and depth_trajectory is not None:
+        logger.info("Using camera trajectory alignment (most robust)...")
+        try:
+            depth_centers, sfm_centers = match_trajectory_and_poses(depth_trajectory, sfm_poses)
+            source_corr = sfm_centers
+            target_corr = depth_centers
+            alignment_method = "camera_trajectory"
+            logger.info(f"Using {len(source_corr)} matched camera positions")
+        except Exception as e:
+            logger.warning(f"Camera trajectory alignment failed: {e}")
+            source_corr = None
 
-    if use_feature_matching and HAS_OPEN3D:
-        # Use FPFH feature matching for correspondences
+    # Method 2: FPFH feature matching (FALLBACK)
+    if source_corr is None and use_feature_matching and HAS_OPEN3D:
         logger.info("Using FPFH feature matching for alignment...")
 
+        # Subsample if too many points
+        if len(sfm_sparse_points) > max_points:
+            indices = np.random.choice(len(sfm_sparse_points), max_points, replace=False)
+            sfm_pts = sfm_sparse_points[indices]
+        else:
+            sfm_pts = sfm_sparse_points
+
+        if len(depth_gt_pointcloud) > max_points:
+            indices = np.random.choice(len(depth_gt_pointcloud), max_points, replace=False)
+            depth_pts = depth_gt_pointcloud[indices]
+        else:
+            depth_pts = depth_gt_pointcloud
+
         sfm_pcd = o3d.geometry.PointCloud()
-        sfm_pcd.points = o3d.utility.Vector3dVector(sfm_sparse_points)
+        sfm_pcd.points = o3d.utility.Vector3dVector(sfm_pts)
 
         depth_pcd = o3d.geometry.PointCloud()
-        depth_pcd.points = o3d.utility.Vector3dVector(depth_gt_pointcloud)
+        depth_pcd.points = o3d.utility.Vector3dVector(depth_pts)
 
         try:
-            source_corr, target_corr = match_point_clouds_fpfh(sfm_pcd, depth_pcd)
+            source_corr, target_corr = match_point_clouds_fpfh(sfm_pcd, depth_pcd, voxel_size=0.02)
+            alignment_method = "fpfh"
         except Exception as e:
-            logger.warning(f"FPFH matching failed: {e}, falling back to centroid alignment")
-            use_feature_matching = False
+            logger.warning(f"FPFH matching failed: {e}")
+            source_corr = None
 
-    if not use_feature_matching or not HAS_OPEN3D:
-        # Fallback: use all points (assumes rough overlap)
-        logger.info("Using full point set alignment (no feature matching)...")
-        source_corr = sfm_sparse_points
-        target_corr = depth_gt_pointcloud[:len(sfm_sparse_points)]
+    # No valid method succeeded
+    if source_corr is None:
+        raise RuntimeError(
+            "All alignment methods failed. Cannot proceed with scale alignment.\n"
+            "Tried: camera_trajectory=" + str(use_camera_trajectory) +
+            ", fpfh=" + str(use_feature_matching)
+        )
 
     # Run Umeyama alignment
     logger.info("Running Umeyama alignment...")
@@ -331,7 +438,8 @@ def align_sfm_to_depth_groundtruth(
         'rotation': R.tolist(),
         'translation': t.tolist(),
         'rmse': float(rmse),
-        'num_correspondences': len(source_corr)
+        'num_correspondences': len(source_corr),
+        'alignment_method': alignment_method
     }
 
 
@@ -386,6 +494,8 @@ def run_sfm_scale_alignment(
     sfm_sparse_dir: str,
     depth_gt_pcd_path: str,
     output_poses_path: str,
+    depth_trajectory_path: Optional[str] = None,
+    use_camera_trajectory: bool = True,
     use_feature_matching: bool = True
 ) -> Dict:
     """
@@ -396,7 +506,9 @@ def run_sfm_scale_alignment(
         sfm_sparse_dir: Path to COLMAP sparse model directory
         depth_gt_pcd_path: Path to depth ground truth point cloud (.ply)
         output_poses_path: Output path for aligned poses
-        use_feature_matching: Whether to use feature matching
+        depth_trajectory_path: Path to depth trajectory.json (from Phase 1)
+        use_camera_trajectory: Try camera trajectory alignment first
+        use_feature_matching: Try FPFH feature matching as fallback
 
     Returns:
         Alignment results dictionary
@@ -410,6 +522,19 @@ def run_sfm_scale_alignment(
     with open(sfm_poses_path, 'r') as f:
         sfm_poses = json.load(f)
     logger.info(f"Loaded {len(sfm_poses)} poses")
+
+    # Load depth trajectory (if available)
+    depth_trajectory = None
+    if use_camera_trajectory and depth_trajectory_path:
+        from pathlib import Path
+        traj_path = Path(depth_trajectory_path)
+        if traj_path.exists():
+            logger.info(f"Loading depth trajectory: {depth_trajectory_path}")
+            with open(traj_path, 'r') as f:
+                depth_trajectory = json.load(f)
+            logger.info(f"Loaded {len(depth_trajectory)} trajectory frames")
+        else:
+            logger.warning(f"Trajectory file not found: {depth_trajectory_path}, will skip camera trajectory alignment")
 
     # Extract SFM sparse points
     logger.info(f"Extracting COLMAP sparse points: {sfm_sparse_dir}")
@@ -430,6 +555,9 @@ def run_sfm_scale_alignment(
     alignment_result = align_sfm_to_depth_groundtruth(
         sfm_sparse_points,
         depth_gt_points,
+        sfm_poses=sfm_poses,
+        depth_trajectory=depth_trajectory,
+        use_camera_trajectory=use_camera_trajectory,
         use_feature_matching=use_feature_matching
     )
 
@@ -457,6 +585,7 @@ def run_sfm_scale_alignment(
         'translation': alignment_result['translation'],
         'rmse': alignment_result['rmse'],
         'num_correspondences': alignment_result['num_correspondences'],
+        'alignment_method': alignment_result.get('alignment_method', 'unknown'),
         'sfm_poses_path': sfm_poses_path,
         'depth_gt_path': depth_gt_pcd_path
     }

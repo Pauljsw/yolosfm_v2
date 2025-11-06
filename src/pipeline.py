@@ -328,7 +328,11 @@ class Pipeline:
 
             # Get alignment config
             align_config = self.config.get('scale_alignment', {})
+            use_camera_trajectory = align_config.get('use_camera_trajectory', True)
             use_feature_matching = align_config.get('use_feature_matching', True)
+
+            # Depth trajectory path
+            depth_trajectory_path = f"{depth_gt_dir}/trajectory.json"
 
             # Run alignment
             result = run_sfm_scale_alignment(
@@ -336,12 +340,16 @@ class Pipeline:
                 sfm_sparse_dir,
                 depth_gt_pcd,
                 output_poses_path,
+                depth_trajectory_path=depth_trajectory_path,
+                use_camera_trajectory=use_camera_trajectory,
                 use_feature_matching=use_feature_matching
             )
 
             logger.info(f"Scale alignment complete:")
+            logger.info(f"  Method: {result.get('alignment_method', 'unknown')}")
             logger.info(f"  Scale factor: {result['scale']:.4f}")
             logger.info(f"  RMSE: {result['rmse']:.4f} m")
+            logger.info(f"  Correspondences: {result['num_correspondences']}")
             logger.info(f"  Aligned poses: {output_poses_path}")
 
             # Update pipeline to use aligned poses

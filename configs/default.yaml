@@ -44,8 +44,9 @@ depth_reconstruction:
 
 # Phase 2: SFM Scale Alignment
 scale_alignment:
-  use_feature_matching: true  # Use FPFH features for correspondence matching
-  max_points: 10000           # Max points for alignment (subsampling)
+  use_camera_trajectory: true  # Use camera trajectory alignment (most robust, recommended)
+  use_feature_matching: true   # Use FPFH features as fallback
+  max_points: 10000            # Max points for alignment (subsampling)
 
 # Phase 3: Depth-to-RGB Alignment
 align:
