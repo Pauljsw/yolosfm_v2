@@ -105,12 +105,14 @@ data/depth/camera_DPT_0_2.png  (↔ camera_RGB_0_2.png)
 
 **형식**: JSON
 
-**필수 파라미터**:
+**지원 형식**: 다음 중 하나 사용 가능 ✅
+
+**형식 A** (권장 - ROS camera_info 직접 사용 가능):
 ```json
 {
   "width": 3840,
   "height": 2160,
-  "K": [
+  "K_matrix": [
     [2246.03125, 0.0, 1903.4835205078125],
     [0.0, 2244.83740234375, 1091.5631103515625],
     [0.0, 0.0, 1.0]
@@ -126,6 +128,37 @@ data/depth/camera_DPT_0_2.png  (↔ camera_RGB_0_2.png)
   "distortion_model": "rational_polynomial"
 }
 ```
+
+**형식 B** (K flat array - 자동 reshape):
+```json
+{
+  "width": 3840,
+  "height": 2160,
+  "K": [2246.03125, 0.0, 1903.4835205078125, 0.0, 2244.83740234375, 1091.5631103515625, 0.0, 0.0, 1.0],
+  "D": [...],
+  "distortion_model": "rational_polynomial"
+}
+```
+
+**형식 C** (완전한 ROS camera_info - R, P 등 추가 필드는 무시됨):
+```json
+{
+  "width": 3840,
+  "height": 2160,
+  "K": [...],
+  "K_matrix": [[...], [...], [...]],
+  "D": [...],
+  "R": [...],
+  "P": [...],
+  "fx": 2246.03125,
+  "fy": 2244.83740234375,
+  "cx": 1903.4835205078125,
+  "cy": 1091.5631103515625,
+  "frame_id": "camera_color_optical_frame",
+  "distortion_model": "rational_polynomial"
+}
+```
+→ ROS에서 출력한 camera_info를 **그대로 복사**해도 작동합니다!
 
 **파라미터 설명**:
 - `width`, `height`: 이미지 해상도
@@ -151,14 +184,16 @@ data/depth/camera_DPT_0_2.png  (↔ camera_RGB_0_2.png)
 
 ### 4. Depth 카메라 캘리브레이션 (`calib/depth_camera_info.json`)
 
-**형식**: JSON
+**형식**: JSON (RGB와 동일한 형식 지원)
 
-**필수 파라미터**:
+**지원 형식**: 다음 중 하나 사용 가능 ✅
+
+**권장 형식** (ROS camera_info 호환):
 ```json
 {
   "width": 512,
   "height": 512,
-  "K": [
+  "K_matrix": [
     [252.00250244140625, 0.0, 263.51019287109375],
     [0.0, 251.96585083007812, 260.2386169433594],
     [0.0, 0.0, 1.0]
@@ -176,6 +211,22 @@ data/depth/camera_DPT_0_2.png  (↔ camera_RGB_0_2.png)
   "distortion_model": "rational_polynomial"
 }
 ```
+
+**ROS에서 추출한 전체 정보도 사용 가능**:
+```json
+{
+  "width": 512,
+  "height": 512,
+  "K": [...],
+  "K_matrix": [[...], [...], [...]],
+  "D": [...],
+  "R": [...],
+  "P": [...],
+  "frame_id": "camera_depth_optical_frame",
+  "distortion_model": "rational_polynomial"
+}
+```
+→ 모든 ROS 필드를 그대로 포함해도 작동합니다!
 
 **필요 이유**:
 - Phase 1: Depth 3D 백프로젝션
