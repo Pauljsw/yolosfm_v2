@@ -240,7 +240,7 @@ class DepthTSDFReconstructor:
         Integrate one RGB-D frame into TSDF volume with odometry.
 
         Args:
-            rgb_img: RGB image (H, W, 3), uint8
+            rgb_img: RGB image (H, W, 3), uint8 - will be resized to match depth if needed
             depth_img: Depth image (H, W), float32 in meters
             K: Camera intrinsic matrix (3, 3)
             frame_id: Frame identifier
@@ -251,11 +251,16 @@ class DepthTSDFReconstructor:
         """
         h, w = depth_img.shape
 
+        # Resize RGB to match depth dimensions if needed
+        if rgb_img is not None and rgb_img.shape[:2] != (h, w):
+            rgb_img = cv2.resize(rgb_img, (w, h), interpolation=cv2.INTER_LINEAR)
+            logger.debug(f"Resized RGB from {rgb_img.shape[:2]} to {(h, w)} to match depth")
+
         # Apply undistortion if enabled
         if self.use_undistortion:
             depth_img = undistort_depth_image(depth_img, self.undist_map1, self.undist_map2)
 
-        # Convert to point cloud for ICP
+        # Convert to point cloud for ICP (use RGB for coloring if available)
         current_pcd = depth_to_pointcloud(
             depth_img, K, rgb_img, self.depth_scale, self.depth_trunc
         )
