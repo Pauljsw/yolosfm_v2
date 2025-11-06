@@ -52,12 +52,23 @@ def load_camera_info(json_path: str) -> CameraCalibration:
     
     width = data['width']
     height = data['height']
-    K = np.array(data['K'], dtype=np.float64)
-    D = np.array(data['D'], dtype=np.float64)
-    
+
+    # Load K matrix - support multiple formats
+    if 'K_matrix' in data:
+        # Format: "K_matrix": [[fx, 0, cx], [0, fy, cy], [0, 0, 1]]
+        K = np.array(data['K_matrix'], dtype=np.float64)
+    elif 'K' in data:
+        K = np.array(data['K'], dtype=np.float64)
+        # If K is flat array (9 elements), reshape to 3x3
+        if K.shape == (9,):
+            K = K.reshape(3, 3)
+    else:
+        raise ValueError("Neither 'K' nor 'K_matrix' found in calibration file")
+
     if K.shape != (3, 3):
         raise ValueError(f"Invalid K matrix shape: {K.shape}, expected (3, 3)")
-    
+
+    D = np.array(data['D'], dtype=np.float64)
     distortion_model = data.get('distortion_model', 'rational_polynomial')
     
     return CameraCalibration(width, height, K, D, distortion_model)
