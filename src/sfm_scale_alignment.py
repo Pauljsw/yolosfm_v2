@@ -82,6 +82,7 @@ def umeyama_alignment(
 def extract_sparse_points_from_colmap(sparse_model_dir: str) -> np.ndarray:
     """
     Extract 3D points from COLMAP sparse reconstruction.
+    Supports both text (.txt) and binary (.bin) formats.
 
     Args:
         sparse_model_dir: COLMAP sparse model directory
@@ -89,26 +90,68 @@ def extract_sparse_points_from_colmap(sparse_model_dir: str) -> np.ndarray:
     Returns:
         points3D array (N, 3)
     """
-    points3d_file = Path(sparse_model_dir) / 'points3D.txt'
+    import struct
 
-    if not points3d_file.exists():
-        raise FileNotFoundError(f"points3D.txt not found: {points3d_file}")
+    sparse_path = Path(sparse_model_dir)
+    points3d_bin = sparse_path / 'points3D.bin'
+    points3d_txt = sparse_path / 'points3D.txt'
 
-    points = []
+    # Try binary format first (more common)
+    if points3d_bin.exists():
+        logger.info(f"Reading COLMAP binary format: {points3d_bin}")
+        points = []
 
-    with open(points3d_file, 'r') as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith('#'):
-                continue
+        with open(points3d_bin, 'rb') as f:
+            # Read number of points
+            num_points = struct.unpack('Q', f.read(8))[0]
 
-            parts = line.split()
-            # Format: POINT3D_ID X Y Z R G B ERROR TRACK[]
-            x, y, z = float(parts[1]), float(parts[2]), float(parts[3])
-            points.append([x, y, z])
+            for _ in range(num_points):
+                # point3D_id (uint64)
+                point_id = struct.unpack('Q', f.read(8))[0]
 
-    points = np.array(points)
-    logger.info(f"Extracted {len(points)} sparse points from COLMAP")
+                # xyz (3 x double)
+                x, y, z = struct.unpack('ddd', f.read(24))
+                points.append([x, y, z])
+
+                # rgb (3 x uint8)
+                r, g, b = struct.unpack('BBB', f.read(3))
+
+                # error (double)
+                error = struct.unpack('d', f.read(8))[0]
+
+                # track length (uint64)
+                track_length = struct.unpack('Q', f.read(8))[0]
+
+                # skip track elements (image_id + point2D_idx = 4 + 4 bytes each)
+                f.read(track_length * 8)
+
+        points = np.array(points)
+        logger.info(f"Extracted {len(points)} sparse points from COLMAP (binary)")
+
+    # Try text format as fallback
+    elif points3d_txt.exists():
+        logger.info(f"Reading COLMAP text format: {points3d_txt}")
+        points = []
+
+        with open(points3d_txt, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+
+                parts = line.split()
+                # Format: POINT3D_ID X Y Z R G B ERROR TRACK[]
+                x, y, z = float(parts[1]), float(parts[2]), float(parts[3])
+                points.append([x, y, z])
+
+        points = np.array(points)
+        logger.info(f"Extracted {len(points)} sparse points from COLMAP (text)")
+
+    else:
+        raise FileNotFoundError(
+            f"COLMAP points3D file not found in {sparse_model_dir}. "
+            f"Tried: points3D.bin, points3D.txt"
+        )
 
     return points
 
