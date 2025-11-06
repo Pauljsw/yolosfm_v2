@@ -64,22 +64,18 @@ def undistort_depth_image(depth: np.ndarray, map1: np.ndarray, map2: np.ndarray)
 def depth_to_pointcloud(
     depth: np.ndarray,
     K: np.ndarray,
-    rgb: Optional[np.ndarray] = None,
-    depth_scale: float = 1.0,
     depth_trunc: float = 10.0
 ) -> o3d.geometry.PointCloud:
     """
-    Convert depth image to Open3D point cloud.
+    Convert depth image to Open3D point cloud (depth-only, no color).
 
     Args:
         depth: Depth image in meters
         K: Camera intrinsic matrix
-        rgb: Optional RGB image for coloring
-        depth_scale: Depth scale factor (not used if depth already in meters)
         depth_trunc: Maximum depth value to consider
 
     Returns:
-        Open3D PointCloud
+        Open3D PointCloud (without colors)
     """
     h, w = depth.shape
     fx, fy = K[0, 0], K[1, 1]
@@ -101,14 +97,9 @@ def depth_to_pointcloud(
 
     points = np.stack([x, y, z], axis=-1)
 
-    # Create point cloud
+    # Create point cloud (no color information)
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(points)
-
-    # Add colors if RGB provided
-    if rgb is not None:
-        colors = rgb.reshape(-1, 3)[valid] / 255.0
-        pcd.colors = o3d.utility.Vector3dVector(colors)
 
     return pcd
 
@@ -206,11 +197,11 @@ class DepthTSDFReconstructor:
         self.icp_max_corr_dist = icp_max_corr_dist
         self.use_undistortion = use_undistortion
 
-        # Create TSDF volume
+        # Create TSDF volume (no color - depth only)
         self.volume = o3d.pipelines.integration.ScalableTSDFVolume(
             voxel_length=tsdf_voxel_length,
             sdf_trunc=self.tsdf_trunc,
-            color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8
+            color_type=o3d.pipelines.integration.TSDFVolumeColorType.NoColor
         )
 
         # Odometry state
@@ -230,17 +221,17 @@ class DepthTSDFReconstructor:
 
     def integrate_frame(
         self,
-        rgb_img: np.ndarray,
         depth_img: np.ndarray,
         K: np.ndarray,
         frame_id: str,
         use_icp: bool = True
     ) -> Dict:
         """
-        Integrate one RGB-D frame into TSDF volume with odometry.
+        Integrate one depth frame into TSDF volume with ICP odometry.
+
+        Note: This is depth-only reconstruction. No RGB/color information is used.
 
         Args:
-            rgb_img: RGB image (H, W, 3), uint8 - will be resized to match depth if needed
             depth_img: Depth image (H, W), float32 in meters
             K: Camera intrinsic matrix (3, 3)
             frame_id: Frame identifier
@@ -251,18 +242,13 @@ class DepthTSDFReconstructor:
         """
         h, w = depth_img.shape
 
-        # Resize RGB to match depth dimensions if needed
-        if rgb_img is not None and rgb_img.shape[:2] != (h, w):
-            rgb_img = cv2.resize(rgb_img, (w, h), interpolation=cv2.INTER_LINEAR)
-            logger.debug(f"Resized RGB from {rgb_img.shape[:2]} to {(h, w)} to match depth")
-
         # Apply undistortion if enabled
         if self.use_undistortion:
             depth_img = undistort_depth_image(depth_img, self.undist_map1, self.undist_map2)
 
-        # Convert to point cloud for ICP (use RGB for coloring if available)
+        # Convert to point cloud for ICP (depth only, no color)
         current_pcd = depth_to_pointcloud(
-            depth_img, K, rgb_img, self.depth_scale, self.depth_trunc
+            depth_img, K, self.depth_trunc
         )
 
         # Estimate camera pose using ICP
@@ -292,13 +278,14 @@ class DepthTSDFReconstructor:
 
         # Convert depth to Open3D format for TSDF integration
         # Open3D expects depth in depth_scale units (e.g., mm if scale=1000)
-        depth_o3d = (depth_img * self.depth_scale).astype(np.uint16)
+        depth_o3d_array = (depth_img * self.depth_scale).astype(np.uint16)
+        depth_o3d = o3d.geometry.Image(depth_o3d_array)
 
-        # Create Open3D images
-        color_o3d = o3d.geometry.Image(rgb_img)
-        depth_o3d = o3d.geometry.Image(depth_o3d)
+        # Create dummy color image (required by RGBDImage API, but ignored by NoColor TSDF)
+        dummy_color = np.zeros((h, w, 3), dtype=np.uint8)
+        color_o3d = o3d.geometry.Image(dummy_color)
 
-        # Create RGBD image
+        # Create RGBD image (color will be ignored since TSDF is NoColor type)
         rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
             color_o3d,
             depth_o3d,
@@ -484,13 +471,7 @@ def run_depth_reconstruction(
     logger.info("=" * 80)
 
     for idx, (rgb_path, depth_path, pair_id) in enumerate(rgb_depth_pairs):
-        # Load images
-        rgb_img = cv2.imread(rgb_path)
-        if rgb_img is None:
-            logger.warning(f"Failed to load RGB image: {rgb_path}")
-            continue
-        rgb_img = cv2.cvtColor(rgb_img, cv2.COLOR_BGR2RGB)
-
+        # Load depth image only (RGB not used in Phase 1)
         depth_img = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
         if depth_img is None:
             logger.warning(f"Failed to load depth image: {depth_path}")
@@ -501,9 +482,9 @@ def run_depth_reconstruction(
         if depth_unit == 'mm':
             depth_img = depth_img / 1000.0
 
-        # Integrate frame with ICP odometry
+        # Integrate frame with ICP odometry (depth only)
         stats = reconstructor.integrate_frame(
-            rgb_img, depth_img, depth_K, pair_id, use_icp=use_icp
+            depth_img, depth_K, pair_id, use_icp=use_icp
         )
 
         logger.info(
