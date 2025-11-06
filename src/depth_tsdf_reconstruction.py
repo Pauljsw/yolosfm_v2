@@ -426,7 +426,7 @@ def run_depth_reconstruction(
         output_dir: Output directory
         tsdf_voxel_size: TSDF voxel size in meters
         tsdf_trunc_factor: TSDF truncation distance = voxel_size * factor
-        depth_unit: Depth unit ('m' or 'mm')
+        depth_unit: Depth unit ('m', 'mm', or 'auto' for auto-detection)
         use_icp: Whether to use ICP for pose estimation
         icp_voxel_size: Voxel size for ICP downsampling
         icp_max_corr_dist: Maximum correspondence distance for ICP
@@ -440,6 +440,19 @@ def run_depth_reconstruction(
     """
     if not HAS_OPEN3D:
         raise ImportError("Open3D required for depth reconstruction")
+
+    # Auto-detect depth unit if needed
+    if depth_unit == 'auto':
+        if len(rgb_depth_pairs) == 0:
+            raise ValueError("Cannot auto-detect depth unit: no depth images provided")
+
+        # Load first depth image to detect unit
+        first_depth_path = rgb_depth_pairs[0][1]
+        first_depth = cv2.imread(first_depth_path, cv2.IMREAD_UNCHANGED).astype(np.float32)
+
+        from .utils import detect_depth_unit
+        depth_unit = detect_depth_unit(first_depth)
+        logger.info(f"Auto-detected depth unit: {depth_unit}")
 
     depth_scale = 1000.0 if depth_unit == 'mm' else 1.0
 
