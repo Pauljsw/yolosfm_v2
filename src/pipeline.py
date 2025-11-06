@@ -16,7 +16,9 @@ from .fusion_3d import LabelFusion
 from .instance_merge import merge_pipeline
 from .measurement import measure_all_instances
 from .export_results import export_all_results
-from .utils import setup_logging, load_config, Timer, ensure_dir, list_files
+from .utils import setup_logging, load_config, Timer, ensure_dir, list_files, find_rgb_depth_pairs
+from .depth_tsdf_reconstruction import run_depth_reconstruction
+from .sfm_scale_alignment import run_sfm_scale_alignment
 
 logger = logging.getLogger(__name__)
 
@@ -65,8 +67,20 @@ class Pipeline:
     def _load_poses(self, *, initial: bool = False) -> None:
         """Load SFM poses if available and build a lookup index."""
 
-        poses_path = Path(self.config['paths']['sfm_dir']) / 'poses.json'
-        if not poses_path.exists():
+        sfm_dir = Path(self.config['paths']['sfm_dir'])
+
+        # Prefer aligned poses if available
+        aligned_poses_path = sfm_dir / 'poses_aligned.json'
+        poses_path = sfm_dir / 'poses.json'
+
+        if aligned_poses_path.exists():
+            poses_file = aligned_poses_path
+            logger.info("Using aligned poses: %s", poses_file)
+        elif poses_path.exists():
+            poses_file = poses_path
+            if not initial:
+                logger.info("Using SFM poses (not aligned): %s", poses_file)
+        else:
             self.poses = {}
             self.pose_index = {}
             message = "No poses found at %s" % poses_path
@@ -76,7 +90,7 @@ class Pipeline:
                 logger.warning(message)
             return
 
-        self.poses = load_poses(str(poses_path))
+        self.poses = load_poses(str(poses_file))
         self.pose_index = {}
         for key in self.poses.keys():
             stem = Path(key).stem
@@ -219,6 +233,110 @@ class Pipeline:
             self._load_poses()
 
         logger.info("SFM stage completed")
+
+    def run_depth_ground_truth(self):
+        """
+        Phase 1: Depth-only Ground Truth Reconstruction
+        Generates absolute-scale 3D model from depth images.
+        """
+        logger.info("=" * 80)
+        logger.info("Phase 1: Depth Ground Truth Reconstruction")
+        logger.info("=" * 80)
+
+        self.reload_calibrations()
+
+        with Timer("Depth Reconstruction"):
+            rgb_dir = self.config['paths']['rgb_dir']
+            depth_dir = self.config['paths']['depth_dir']
+            output_dir = self.config['paths'].get('depth_gt_dir', 'output_depth_tsdf')
+
+            # Find RGB-Depth pairs
+            pairs = find_rgb_depth_pairs(rgb_dir, depth_dir)
+
+            if not pairs:
+                logger.error("No RGB-Depth pairs found!")
+                return
+
+            logger.info(f"Found {len(pairs)} RGB-Depth pairs")
+
+            # Get reconstruction config
+            depth_config = self.config.get('depth_reconstruction', {})
+            voxel_size = depth_config.get('voxel_size_m', 0.01)
+            depth_unit = depth_config.get('depth_unit', 'auto')
+            use_icp = depth_config.get('use_icp', False)
+
+            # Run reconstruction
+            results = run_depth_reconstruction(
+                pairs,
+                self.depth_calib.K,
+                output_dir=output_dir,
+                voxel_length=voxel_size,
+                depth_unit=depth_unit,
+                use_icp=use_icp
+            )
+
+            logger.info(f"Depth reconstruction complete:")
+            logger.info(f"  Point cloud: {results['pcd_path']}")
+            logger.info(f"  Points: {results['num_points']}")
+
+        logger.info("Phase 1 completed")
+
+    def run_sfm_scale_align(self):
+        """
+        Phase 2: SFM Scale Alignment
+        Aligns SFM poses to absolute scale using depth ground truth.
+        """
+        logger.info("=" * 80)
+        logger.info("Phase 2: SFM Scale Alignment")
+        logger.info("=" * 80)
+
+        with Timer("Scale Alignment"):
+            sfm_dir = self.config['paths']['sfm_dir']
+            sfm_poses_path = f"{sfm_dir}/poses.json"
+            sfm_sparse_dir = f"{sfm_dir}/sparse/0"
+
+            depth_gt_dir = self.config['paths'].get('depth_gt_dir', 'output_depth_tsdf')
+            depth_gt_pcd = f"{depth_gt_dir}/fused_pointcloud.ply"
+
+            output_poses_path = f"{sfm_dir}/poses_aligned.json"
+
+            # Check if files exist
+            if not Path(sfm_poses_path).exists():
+                logger.error(f"SFM poses not found: {sfm_poses_path}")
+                logger.error("Run SFM stage first!")
+                return
+
+            if not Path(depth_gt_pcd).exists():
+                logger.error(f"Depth ground truth not found: {depth_gt_pcd}")
+                logger.error("Run depth reconstruction stage first!")
+                return
+
+            if not Path(sfm_sparse_dir).exists():
+                logger.error(f"COLMAP sparse model not found: {sfm_sparse_dir}")
+                return
+
+            # Get alignment config
+            align_config = self.config.get('scale_alignment', {})
+            use_feature_matching = align_config.get('use_feature_matching', True)
+
+            # Run alignment
+            result = run_sfm_scale_alignment(
+                sfm_poses_path,
+                sfm_sparse_dir,
+                depth_gt_pcd,
+                output_poses_path,
+                use_feature_matching=use_feature_matching
+            )
+
+            logger.info(f"Scale alignment complete:")
+            logger.info(f"  Scale factor: {result['scale']:.4f}")
+            logger.info(f"  RMSE: {result['rmse']:.4f} m")
+            logger.info(f"  Aligned poses: {output_poses_path}")
+
+            # Update pipeline to use aligned poses
+            self._load_poses()
+
+        logger.info("Phase 2 completed")
 
 
     def run_alignment(self):
@@ -556,7 +674,8 @@ def main():
     """Main entry point"""
     parser = argparse.ArgumentParser(description='YOLO + SFM 3D Fusion Pipeline')
 
-    parser.add_argument('command', choices=['sfm', 'align', 'infer', 'fuse3d', 'report', 'full'],
+    parser.add_argument('command',
+                       choices=['sfm', 'depth_gt', 'scale_align', 'align', 'infer', 'fuse3d', 'report', 'full'],
                        help='Pipeline command to run')
     parser.add_argument('--config', type=str, default='configs/default.yaml',
                        help='Path to configuration file')
@@ -567,63 +686,98 @@ def main():
                        help='Logging level')
     parser.add_argument('--log-file', type=str, default=None,
                        help='Optional log file path')
-    
+    parser.add_argument('--skip-scale-align', action='store_true',
+                       help='Skip scale alignment step in full pipeline')
+
     args = parser.parse_args()
-    
+
     # Setup logging
     setup_logging(args.log_level, args.log_file)
-    
+
     logger.info("=" * 80)
     logger.info("YOLO + SFM 3D Fusion Pipeline")
     logger.info("=" * 80)
     logger.info(f"Command: {args.command}")
     logger.info(f"Config: {args.config}")
-    
+
     # Check config exists
     if not Path(args.config).exists():
         logger.error(f"Configuration file not found: {args.config}")
         sys.exit(1)
-    
+
     # Initialize pipeline
     try:
         pipeline = Pipeline(args.config)
     except Exception as e:
         logger.error(f"Failed to initialize pipeline: {e}", exc_info=True)
         sys.exit(1)
-    
+
     # Run command
     try:
         if args.command == 'sfm':
             pipeline.run_sfm()
-        
+
+        elif args.command == 'depth_gt':
+            pipeline.run_depth_ground_truth()
+
+        elif args.command == 'scale_align':
+            pipeline.run_sfm_scale_align()
+
         elif args.command == 'align':
             pipeline.run_alignment()
-        
+
         elif args.command == 'infer':
             reinfer_mode = args.reinfer if args.reinfer != 'off' else 'auto'
             pipeline.run_detection(reinfer_mode=reinfer_mode)
 
         elif args.command == 'fuse3d':
             pipeline.run_fusion(reinfer_mode=args.reinfer)
-        
+
         elif args.command == 'report':
             pipeline.run_report()
-        
+
         elif args.command == 'full':
-            # Run full pipeline (skip SFM if poses already exist)
+            # Full pipeline with all phases
+            logger.info("Running FULL pipeline with scale alignment")
+
+            # Phase 0: Check/Run SFM
             poses_path = Path(pipeline.config['paths']['sfm_dir']) / 'poses.json'
             if not poses_path.exists():
                 logger.info("Poses not found, running SFM first...")
                 pipeline.run_sfm()
+
+            # Phase 1: Depth ground truth reconstruction
+            depth_gt_dir = pipeline.config['paths'].get('depth_gt_dir', 'output_depth_tsdf')
+            depth_gt_pcd = Path(depth_gt_dir) / 'fused_pointcloud.ply'
+
+            if not depth_gt_pcd.exists():
+                logger.info("Depth ground truth not found, running reconstruction...")
+                pipeline.run_depth_ground_truth()
+            else:
+                logger.info(f"Using existing depth ground truth: {depth_gt_pcd}")
+
+            # Phase 2: Scale alignment
+            if not args.skip_scale_align:
+                aligned_poses_path = Path(pipeline.config['paths']['sfm_dir']) / 'poses_aligned.json'
+                if not aligned_poses_path.exists():
+                    logger.info("Running SFM scale alignment...")
+                    pipeline.run_sfm_scale_align()
+                else:
+                    logger.info(f"Using existing aligned poses: {aligned_poses_path}")
+                    pipeline._load_poses()  # Reload to use aligned poses
+            else:
+                logger.info("Skipping scale alignment (--skip-scale-align)")
+
+            # Phase 3-7: Rest of pipeline
             pipeline.run_alignment()
             pipeline.run_detection(reinfer_mode=args.reinfer)
             pipeline.run_fusion(reinfer_mode=args.reinfer)
             pipeline.run_report()
-    
+
     except Exception as e:
         logger.error(f"Pipeline failed: {e}", exc_info=True)
         sys.exit(1)
-    
+
     logger.info("=" * 80)
     logger.info("Pipeline execution completed")
     logger.info("=" * 80)

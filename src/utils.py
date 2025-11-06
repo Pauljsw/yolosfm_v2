@@ -72,28 +72,113 @@ def ensure_dir(directory: str):
 def list_files(directory: str, extension: str = '*') -> List[str]:
     """
     List files in directory with given extension.
-    
+
     Args:
         directory: Directory path
         extension: File extension (e.g., '.png', '*' for all)
-        
+
     Returns:
         List of file paths
     """
     path = Path(directory)
-    
+
     if not path.exists():
         return []
-    
+
     if extension == '*':
         pattern = '*'
     else:
         if not extension.startswith('.'):
             extension = '.' + extension
         pattern = f'*{extension}'
-    
+
     files = sorted(path.glob(pattern))
     return [str(f) for f in files]
+
+
+def parse_rgb_dpt_filename(filename: str) -> Optional[Tuple[str, str, str]]:
+    """
+    Parse RGB/Depth filename pattern: camera_RGB_X_Y.png or camera_DPT_X_Y.png
+
+    Args:
+        filename: Filename to parse
+
+    Returns:
+        (type, id1, id2) where type is 'RGB' or 'DPT', or None if pattern doesn't match
+    """
+    import re
+
+    stem = Path(filename).stem
+    match = re.match(r'camera_(RGB|DPT)_(\d+)_(\d+)', stem)
+
+    if match:
+        return match.group(1), match.group(2), match.group(3)
+
+    return None
+
+
+def find_rgb_depth_pairs(rgb_dir: str, depth_dir: str) -> List[Tuple[str, str, str]]:
+    """
+    Find matching RGB-Depth image pairs based on filename pattern.
+
+    Args:
+        rgb_dir: RGB images directory
+        depth_dir: Depth images directory
+
+    Returns:
+        List of (rgb_path, depth_path, pair_id) tuples
+    """
+    rgb_files = list_files(rgb_dir, '.png')
+    depth_files = list_files(depth_dir, '.png')
+
+    # Parse RGB files
+    rgb_map = {}  # (id1, id2) -> path
+    for rgb_path in rgb_files:
+        parsed = parse_rgb_dpt_filename(rgb_path)
+        if parsed and parsed[0] == 'RGB':
+            _, id1, id2 = parsed
+            rgb_map[(id1, id2)] = rgb_path
+
+    # Parse Depth files and match
+    pairs = []
+    for depth_path in depth_files:
+        parsed = parse_rgb_dpt_filename(depth_path)
+        if parsed and parsed[0] == 'DPT':
+            _, id1, id2 = parsed
+            if (id1, id2) in rgb_map:
+                rgb_path = rgb_map[(id1, id2)]
+                pair_id = f"{id1}_{id2}"
+                pairs.append((rgb_path, depth_path, pair_id))
+
+    logging.info(f"Found {len(pairs)} RGB-Depth pairs")
+    return pairs
+
+
+def detect_depth_unit(depth_img: np.ndarray) -> str:
+    """
+    Auto-detect depth image unit (m or mm) based on value range.
+
+    Args:
+        depth_img: Depth image array
+
+    Returns:
+        'm' or 'mm'
+    """
+    valid_depths = depth_img[depth_img > 0]
+
+    if len(valid_depths) == 0:
+        logging.warning("No valid depth values found, assuming mm")
+        return 'mm'
+
+    median_depth = np.median(valid_depths)
+    max_depth = np.max(valid_depths)
+
+    # Heuristic: if median > 100, likely mm; if < 100, likely m
+    # Typical indoor scenes: 1-10m (1000-10000mm)
+    if median_depth > 100:
+        return 'mm'
+    else:
+        return 'm'
 
 
 def compute_statistics(values: np.ndarray) -> Dict:

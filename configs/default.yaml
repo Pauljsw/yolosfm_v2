@@ -3,6 +3,7 @@ paths:
   depth_dir: data/depth
   masks_dir: data/yolo_masks
   sfm_dir: data/sfm
+  depth_gt_dir: output_depth_tsdf  # Phase 1 output
   calib_rgb: calib/rgb_camera_info.json
   calib_depth: calib/depth_camera_info.json
   out_dir: outputs
@@ -22,8 +23,21 @@ sfm:
   use_gpu: true
   dense: false              # Run dense reconstruction (slow)
 
+# Phase 1: Depth-only Ground Truth Reconstruction
+depth_reconstruction:
+  voxel_size_m: 0.01         # 1cm voxels for ground truth
+  depth_unit: "auto"         # "m", "mm", or "auto" (auto-detect)
+  use_icp: false             # Use ICP for pose estimation (slower but more accurate)
+
+# Phase 2: SFM Scale Alignment
+scale_alignment:
+  use_feature_matching: true  # Use FPFH features for correspondence matching
+  max_points: 10000           # Max points for alignment (subsampling)
+
+# Phase 3: Depth-to-RGB Alignment
 align:
-  in_depth_unit: "m"        # or "mm"
+  in_depth_unit: "auto"      # "m", "mm", or "auto" (auto-detect)
+  use_simple_resize: false   # True for hardware-aligned depth (Orbbec)
   hole_fill: true
   joint_bilateral: true
   bilateral_d: 9

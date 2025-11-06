@@ -102,11 +102,12 @@ def align_depth_to_rgb(
     depth_unit: str = 'm',
     hole_fill: bool = True,
     joint_bilateral: bool = True,
-    bilateral_params: Optional[dict] = None
+    bilateral_params: Optional[dict] = None,
+    use_simple_resize: bool = False
 ) -> np.ndarray:
     """
     Align depth image to RGB image resolution and frame.
-    
+
     Pipeline:
     1. Undistort depth coordinates
     2. Backproject to 3D (depth camera frame)
@@ -114,7 +115,7 @@ def align_depth_to_rgb(
     4. Project to RGB image coordinates
     5. Z-buffer to handle overlaps
     6. Hole filling and smoothing
-    
+
     Args:
         depth_img: HxW depth image (e.g., 512x512)
         rgb_K: 3x3 RGB camera intrinsic matrix
@@ -123,22 +124,54 @@ def align_depth_to_rgb(
         depth_D: Depth camera distortion coefficients
         rgb_size: (width, height) of RGB image (e.g., 3840x2160)
         T_d2r: Optional (R, t) transformation from depth to RGB frame
-        depth_unit: 'm' or 'mm'
+        depth_unit: 'm' or 'mm' or 'auto'
         hole_fill: Whether to fill holes
         joint_bilateral: Whether to apply joint bilateral filter
         bilateral_params: Parameters for bilateral filter
-        
+        use_simple_resize: Use simple resize (for hardware-aligned depth like Orbbec)
+
     Returns:
         Aligned depth image at RGB resolution (H_rgb x W_rgb), in meters
     """
     h_depth, w_depth = depth_img.shape
     w_rgb, h_rgb = rgb_size
-    
+
     logger.info(f"Aligning depth {w_depth}x{h_depth} to RGB {w_rgb}x{h_rgb}")
-    
+
+    # Auto-detect depth unit if requested
+    if depth_unit == 'auto':
+        from .utils import detect_depth_unit
+        depth_unit = detect_depth_unit(depth_img)
+        logger.info(f"Auto-detected depth unit: {depth_unit}")
+
     # Convert depth to meters
     if depth_unit == 'mm':
         depth_img = depth_img / 1000.0
+
+    # FAST PATH: For hardware-aligned depth (e.g., Orbbec aligned_depth_to_color)
+    if use_simple_resize:
+        logger.info("Using simple resize (hardware-aligned depth)")
+        aligned_depth = cv2.resize(depth_img, (w_rgb, h_rgb), interpolation=cv2.INTER_NEAREST)
+
+        if hole_fill:
+            aligned_depth = fill_depth_holes(aligned_depth)
+
+        if joint_bilateral:
+            if bilateral_params is None:
+                bilateral_params = {'d': 9, 'sigma_color': 75, 'sigma_space': 75}
+            max_val = np.max(aligned_depth)
+            if max_val > 0:
+                depth_normalized = (aligned_depth / max_val * 255).astype(np.uint8)
+                depth_filtered = cv2.bilateralFilter(
+                    depth_normalized,
+                    bilateral_params['d'],
+                    bilateral_params['sigma_color'],
+                    bilateral_params['sigma_space']
+                )
+                aligned_depth = (depth_filtered / 255.0) * max_val
+
+        logger.info(f"Filled pixels: {np.sum(aligned_depth > 0)}/{h_rgb*w_rgb}")
+        return aligned_depth
     
     # Create coordinate grids
     u_depth, v_depth = np.meshgrid(np.arange(w_depth), np.arange(h_depth))
