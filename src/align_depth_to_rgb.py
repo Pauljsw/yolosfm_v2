@@ -202,7 +202,9 @@ def align_depth_to_rgb(
     # Transform to RGB frame if needed
     if T_d2r is not None:
         R, t = T_d2r
-        points_3d = (R @ points_3d.T).T + t.T
+        # Apply: P_color = R @ P_depth + t
+        # Using matrix form: points @ R.T + t.T for vectorized operation
+        points_3d = points_3d @ R.T + t.T  # t is (3,1), t.T is (1,3) for broadcasting
     
     # Project to RGB image
     rgb_coords, valid_proj = project_3d_to_image(points_3d, rgb_K)
@@ -245,18 +247,22 @@ def align_depth_to_rgb(
     if joint_bilateral:
         if bilateral_params is None:
             bilateral_params = {'d': 9, 'sigma_color': 75, 'sigma_space': 75}
-        
-        # Convert to 8-bit for bilateral filter
-        depth_normalized = (aligned_depth / np.max(aligned_depth) * 255).astype(np.uint8)
-        depth_filtered = cv2.bilateralFilter(
-            depth_normalized,
-            bilateral_params['d'],
-            bilateral_params['sigma_color'],
-            bilateral_params['sigma_space']
-        )
-        # Convert back
-        aligned_depth = (depth_filtered / 255.0) * np.max(aligned_depth)
-        logger.debug("Bilateral filtering completed")
+
+        max_val = np.max(aligned_depth)
+        if max_val > 0:  # Avoid division by zero
+            # Convert to 8-bit for bilateral filter
+            depth_normalized = (aligned_depth / max_val * 255).astype(np.uint8)
+            depth_filtered = cv2.bilateralFilter(
+                depth_normalized,
+                bilateral_params['d'],
+                bilateral_params['sigma_color'],
+                bilateral_params['sigma_space']
+            )
+            # Convert back
+            aligned_depth = (depth_filtered / 255.0) * max_val
+            logger.debug("Bilateral filtering completed")
+        else:
+            logger.warning("Skipping bilateral filter: no valid depth values")
     
     return aligned_depth
 
