@@ -5,7 +5,9 @@ extract_extrinsic
 CMakeLists_extract.txt
 build_extract/
 
-# Calibration files generated from camera
+# Calibration files (camera-specific, not for repository)
+calib/*.json
+calib/*.txt
 calib/*_sdk.json
 calib/extrinsic_*.json
 
