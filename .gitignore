@@ -4,6 +4,9 @@ extract_extrinsic.py
 extract_extrinsic
 CMakeLists_extract.txt
 build_extract/
+test_invert_extrinsic.py
+debug_*.py
+debug_*.png
 
 # Calibration files (camera-specific, not for repository)
 calib/*.json
