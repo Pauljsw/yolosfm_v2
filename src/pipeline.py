@@ -408,7 +408,8 @@ class Pipeline:
                     depth_unit=align_config['in_depth_unit'],
                     hole_fill=align_config['hole_fill'],
                     joint_bilateral=align_config['joint_bilateral'],
-                    bilateral_params=bilateral_params
+                    bilateral_params=bilateral_params,
+                    use_simple_resize=align_config.get('use_simple_resize', False)
                 )
                 
                 # Save
