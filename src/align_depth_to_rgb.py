@@ -212,9 +212,12 @@ def align_depth_to_rgb(
     # Filter valid projections
     valid_proj &= (rgb_coords[:, 0] >= 0) & (rgb_coords[:, 0] < w_rgb)
     valid_proj &= (rgb_coords[:, 1] >= 0) & (rgb_coords[:, 1] < h_rgb)
-    
+
     rgb_coords = rgb_coords[valid_proj]
-    depth_values_proj = points_3d[valid_proj, 2]  # Use z-coordinate from 3D
+    # CRITICAL: Use original depth measurements, not transformed z-coordinate
+    # The transformation changes pixel coordinates, but depth values stay the same
+    # (depth = distance measured by depth sensor, regardless of camera frame)
+    depth_values_proj = depth_values[valid_proj]
     
     logger.debug(f"Valid projections: {len(depth_values_proj)}/{len(valid_proj)}")
     
