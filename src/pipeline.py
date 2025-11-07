@@ -368,6 +368,26 @@ class Pipeline:
 
         self.reload_calibrations()
 
+        # Load extrinsic transformation (Depth → Color)
+        import json
+        calib_dir = Path(self.config['paths'].get('calib_dir', 'calib'))
+        extrinsic_path = calib_dir / 'extrinsic_depth_to_color.json'
+        T_d2r = None
+
+        if extrinsic_path.exists():
+            with open(extrinsic_path, 'r') as f:
+                extrinsic_data = json.load(f)
+                R = np.array(extrinsic_data['R'])
+                t = np.array(extrinsic_data['t']).reshape(3, 1)
+                T_d2r = (R, t)
+                logger.info(f"✅ Loaded extrinsic transformation from: {extrinsic_path}")
+                logger.info(f"   Translation (t): {t.flatten()} meters")
+                logger.info(f"   Baseline: {np.linalg.norm(t)*1000:.2f} mm")
+        else:
+            logger.warning(f"⚠️  Extrinsic file not found: {extrinsic_path}")
+            logger.warning("   Using identity transformation (T_d2r=None)")
+            logger.warning("   This may cause significant alignment errors (>500px)")
+
         with Timer("Alignment"):
             # Get list of depth images
             depth_dir = self.config['paths']['depth_dir']
@@ -405,6 +425,7 @@ class Pipeline:
                     self.depth_calib.K,
                     self.depth_calib.D,
                     rgb_size=(self.rgb_calib.width, self.rgb_calib.height),
+                    T_d2r=T_d2r,  # ⭐ Extrinsic transformation (Depth → Color)
                     depth_unit=align_config['in_depth_unit'],
                     hole_fill=align_config['hole_fill'],
                     joint_bilateral=align_config['joint_bilateral'],
