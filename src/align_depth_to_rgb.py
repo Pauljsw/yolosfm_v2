@@ -102,11 +102,12 @@ def align_depth_to_rgb(
     depth_unit: str = 'm',
     hole_fill: bool = True,
     joint_bilateral: bool = True,
-    bilateral_params: Optional[dict] = None
+    bilateral_params: Optional[dict] = None,
+    use_simple_resize: bool = False
 ) -> np.ndarray:
     """
     Align depth image to RGB image resolution and frame.
-    
+
     Pipeline:
     1. Undistort depth coordinates
     2. Backproject to 3D (depth camera frame)
@@ -114,7 +115,7 @@ def align_depth_to_rgb(
     4. Project to RGB image coordinates
     5. Z-buffer to handle overlaps
     6. Hole filling and smoothing
-    
+
     Args:
         depth_img: HxW depth image (e.g., 512x512)
         rgb_K: 3x3 RGB camera intrinsic matrix
@@ -123,22 +124,54 @@ def align_depth_to_rgb(
         depth_D: Depth camera distortion coefficients
         rgb_size: (width, height) of RGB image (e.g., 3840x2160)
         T_d2r: Optional (R, t) transformation from depth to RGB frame
-        depth_unit: 'm' or 'mm'
+        depth_unit: 'm' or 'mm' or 'auto'
         hole_fill: Whether to fill holes
         joint_bilateral: Whether to apply joint bilateral filter
         bilateral_params: Parameters for bilateral filter
-        
+        use_simple_resize: Use simple resize (for hardware-aligned depth like Orbbec)
+
     Returns:
         Aligned depth image at RGB resolution (H_rgb x W_rgb), in meters
     """
     h_depth, w_depth = depth_img.shape
     w_rgb, h_rgb = rgb_size
-    
+
     logger.info(f"Aligning depth {w_depth}x{h_depth} to RGB {w_rgb}x{h_rgb}")
-    
+
+    # Auto-detect depth unit if requested
+    if depth_unit == 'auto':
+        from .utils import detect_depth_unit
+        depth_unit = detect_depth_unit(depth_img)
+        logger.info(f"Auto-detected depth unit: {depth_unit}")
+
     # Convert depth to meters
     if depth_unit == 'mm':
         depth_img = depth_img / 1000.0
+
+    # FAST PATH: For hardware-aligned depth (e.g., Orbbec aligned_depth_to_color)
+    if use_simple_resize:
+        logger.info("Using simple resize (hardware-aligned depth)")
+        aligned_depth = cv2.resize(depth_img, (w_rgb, h_rgb), interpolation=cv2.INTER_NEAREST)
+
+        if hole_fill:
+            aligned_depth = fill_depth_holes(aligned_depth)
+
+        if joint_bilateral:
+            if bilateral_params is None:
+                bilateral_params = {'d': 9, 'sigma_color': 75, 'sigma_space': 75}
+            max_val = np.max(aligned_depth)
+            if max_val > 0:
+                depth_normalized = (aligned_depth / max_val * 255).astype(np.uint8)
+                depth_filtered = cv2.bilateralFilter(
+                    depth_normalized,
+                    bilateral_params['d'],
+                    bilateral_params['sigma_color'],
+                    bilateral_params['sigma_space']
+                )
+                aligned_depth = (depth_filtered / 255.0) * max_val
+
+        logger.info(f"Filled pixels: {np.sum(aligned_depth > 0)}/{h_rgb*w_rgb}")
+        return aligned_depth
     
     # Create coordinate grids
     u_depth, v_depth = np.meshgrid(np.arange(w_depth), np.arange(h_depth))
@@ -169,7 +202,9 @@ def align_depth_to_rgb(
     # Transform to RGB frame if needed
     if T_d2r is not None:
         R, t = T_d2r
-        points_3d = (R @ points_3d.T).T + t.T
+        # Apply: P_color = R @ P_depth + t
+        # Using matrix form: points @ R.T + t.T for vectorized operation
+        points_3d = points_3d @ R.T + t.T  # t is (3,1), t.T is (1,3) for broadcasting
     
     # Project to RGB image
     rgb_coords, valid_proj = project_3d_to_image(points_3d, rgb_K)
@@ -177,9 +212,12 @@ def align_depth_to_rgb(
     # Filter valid projections
     valid_proj &= (rgb_coords[:, 0] >= 0) & (rgb_coords[:, 0] < w_rgb)
     valid_proj &= (rgb_coords[:, 1] >= 0) & (rgb_coords[:, 1] < h_rgb)
-    
+
     rgb_coords = rgb_coords[valid_proj]
-    depth_values_proj = points_3d[valid_proj, 2]  # Use z-coordinate from 3D
+    # CRITICAL: Use original depth measurements, not transformed z-coordinate
+    # The transformation changes pixel coordinates, but depth values stay the same
+    # (depth = distance measured by depth sensor, regardless of camera frame)
+    depth_values_proj = depth_values[valid_proj]
     
     logger.debug(f"Valid projections: {len(depth_values_proj)}/{len(valid_proj)}")
     
@@ -212,18 +250,22 @@ def align_depth_to_rgb(
     if joint_bilateral:
         if bilateral_params is None:
             bilateral_params = {'d': 9, 'sigma_color': 75, 'sigma_space': 75}
-        
-        # Convert to 8-bit for bilateral filter
-        depth_normalized = (aligned_depth / np.max(aligned_depth) * 255).astype(np.uint8)
-        depth_filtered = cv2.bilateralFilter(
-            depth_normalized,
-            bilateral_params['d'],
-            bilateral_params['sigma_color'],
-            bilateral_params['sigma_space']
-        )
-        # Convert back
-        aligned_depth = (depth_filtered / 255.0) * np.max(aligned_depth)
-        logger.debug("Bilateral filtering completed")
+
+        max_val = np.max(aligned_depth)
+        if max_val > 0:  # Avoid division by zero
+            # Convert to 8-bit for bilateral filter
+            depth_normalized = (aligned_depth / max_val * 255).astype(np.uint8)
+            depth_filtered = cv2.bilateralFilter(
+                depth_normalized,
+                bilateral_params['d'],
+                bilateral_params['sigma_color'],
+                bilateral_params['sigma_space']
+            )
+            # Convert back
+            aligned_depth = (depth_filtered / 255.0) * max_val
+            logger.debug("Bilateral filtering completed")
+        else:
+            logger.warning("Skipping bilateral filter: no valid depth values")
     
     return aligned_depth
 

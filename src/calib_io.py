@@ -52,12 +52,24 @@ def load_camera_info(json_path: str) -> CameraCalibration:
     
     width = data['width']
     height = data['height']
-    K = np.array(data['K'], dtype=np.float64)
-    D = np.array(data['D'], dtype=np.float64)
-    
+
+    # Load K matrix - support multiple formats
+    # Prefer K_matrix (nested array) but fall back to K (can be flat or nested)
+    if 'K_matrix' in data:
+        K = np.array(data['K_matrix'], dtype=np.float64)
+    else:
+        if 'K' not in data:
+            raise ValueError("Neither 'K' nor 'K_matrix' found in calibration file")
+        K = np.array(data['K'], dtype=np.float64)
+
+    # Auto-reshape if flat array (ROS camera_info format)
+    if K.ndim == 1 and K.shape[0] == 9:
+        K = K.reshape(3, 3)
+
     if K.shape != (3, 3):
         raise ValueError(f"Invalid K matrix shape: {K.shape}, expected (3, 3)")
-    
+
+    D = np.array(data['D'], dtype=np.float64)
     distortion_model = data.get('distortion_model', 'rational_polynomial')
     
     return CameraCalibration(width, height, K, D, distortion_model)

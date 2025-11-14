@@ -2,7 +2,19 @@
 
 ## Overview
 
-This project implements an end-to-end pipeline for fusing 2D YOLO segmentation masks into a 3D global coordinate system using Structure from Motion (SFM). The pipeline handles multiple RGB-D images, merges fragmented defect instances across views, and provides quantitative measurements (length, area, orientation).
+This project implements a **complete end-to-end pipeline** for 3D defect detection and measurement from RGB-D images. The pipeline fuses 2D YOLO segmentation masks into a 3D global coordinate system using Structure from Motion (SFM) with **absolute scale alignment** via depth ground truth. It handles multiple RGB-D images, merges fragmented defect instances across views, and provides quantitative measurements (length, area, orientation).
+
+### 🆕 Key Features (Updated)
+
+- **Phase 1-2: Absolute Scale Reconstruction** ⭐ **NEW**
+  - Depth-only TSDF reconstruction for ground truth
+  - Umeyama algorithm for SFM scale alignment
+  - Eliminates scale ambiguity in pure visual SFM
+
+- **Robust RGB-D Processing**
+  - Auto-detection of depth units (mm/m)
+  - Hardware-aligned depth support (Orbbec Femto Bolt)
+  - Filename-based RGB-Depth pairing
 
 ## Key Features
 
@@ -74,17 +86,33 @@ pip install -r requirements.txt
 
 ## Quick Start
 
-### 1. Prepare Data
+### 1. Installation
 
-Place your data in the following structure:
+```bash
+pip install -r requirements.txt
+
+# Verify Open3D (required for Phase 1-2)
+python -c "import open3d; print(open3d.__version__)"
+```
+
+### 2. Prepare Data
+
+Place your RGB-D data with matched filenames:
 
 ```
 data/
-├── rgb/*.png              # RGB images
-├── depth/*.png            # Depth images (same filenames)
-├── yolo_masks/*.json      # YOLO mask annotations
-└── sfm/poses.json         # Camera poses
+├── rgb/
+│   ├── camera_RGB_0_0.png
+│   ├── camera_RGB_0_1.png
+│   └── ...
+├── depth/
+│   ├── camera_DPT_0_0.png  # Matches camera_RGB_0_0.png
+│   ├── camera_DPT_0_1.png
+│   └── ...
+└── (sfm/ and yolo_masks/ will be auto-generated)
 ```
+
+**Naming convention**: `camera_RGB_X_Y.png` ↔ `camera_DPT_X_Y.png` (X_Y must match)
 
 ### 2. Configure Calibration
 
@@ -96,23 +124,47 @@ python -m src.calib_io create-samples
 
 Edit `calib/rgb_camera_info.json` and `calib/depth_camera_info.json` with your camera parameters.
 
-### 3. Run Pipeline
+### 3. Configure YOLO Model
 
-**Full pipeline:**
+Place your trained YOLO segmentation model:
+```
+models/best.pt
+```
+
+### 4. Run Full Pipeline
+
+**Automatic (Recommended)**:
 ```bash
 python -m src.pipeline full --config configs/default.yaml
 ```
 
-**Step-by-step:**
+This runs all phases automatically:
+- Phase 0: SFM pose estimation (COLMAP)
+- Phase 1: Depth ground truth reconstruction
+- Phase 2: SFM scale alignment ⭐
+- Phase 3: Depth-RGB alignment
+- Phase 4: YOLO segmentation
+- Phase 5-7: 3D fusion, merging, measurement
+
+**Manual step-by-step**:
 ```bash
-# Stage 1: Align depth to RGB
+# Phase 0: SFM
+python -m src.pipeline sfm --config configs/default.yaml
+
+# Phase 1: Depth ground truth
+python -m src.pipeline depth_gt --config configs/default.yaml
+
+# Phase 2: Scale alignment ⭐
+python -m src.pipeline scale_align --config configs/default.yaml
+
+# Phase 3: Depth-RGB alignment
 python -m src.pipeline align --config configs/default.yaml
 
-# Stage 2: 3D fusion and measurement
-python -m src.pipeline fuse3d --config configs/default.yaml --reinfer auto
+# Phase 4: YOLO inference
+python -m src.pipeline infer --config configs/default.yaml
 
-# Stage 3: Generate report
-python -m src.pipeline report --config configs/default.yaml
+# Phase 5-7: Fusion + measurement
+python -m src.pipeline fuse3d --config configs/default.yaml
 ```
 
 ## Configuration

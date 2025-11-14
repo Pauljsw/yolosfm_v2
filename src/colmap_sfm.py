@@ -279,74 +279,212 @@ class COLMAPRunner:
         return poses
     
     def _read_cameras_txt(self, cameras_file: Path) -> Dict:
-        """Read COLMAP cameras.txt"""
-        cameras = {}
-        
-        if not cameras_file.exists():
-            raise FileNotFoundError(f"cameras.txt not found: {cameras_file}")
-        
-        with open(cameras_file, 'r') as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith('#'):
-                    continue
-                
-                parts = line.split()
-                cam_id = int(parts[0])
-                model = parts[1]
-                width = int(parts[2])
-                height = int(parts[3])
-                params = [float(p) for p in parts[4:]]
-                
-                cameras[cam_id] = {
-                    'model': model,
-                    'width': width,
-                    'height': height,
-                    'params': params
-                }
-        
-        logger.debug(f"Read {len(cameras)} cameras")
-        return cameras
+        """
+        Read COLMAP cameras file (supports both .txt and .bin formats).
+
+        Args:
+            cameras_file: Path to cameras.txt (will also try cameras.bin)
+
+        Returns:
+            Dictionary of camera data
+        """
+        import struct
+
+        # Try binary format first
+        cameras_bin = cameras_file.parent / 'cameras.bin'
+        cameras_txt = cameras_file
+
+        if cameras_bin.exists():
+            logger.debug(f"Reading COLMAP cameras (binary): {cameras_bin}")
+            cameras = {}
+
+            # COLMAP camera model ID to name mapping
+            CAMERA_MODEL_NAMES = {
+                0: 'SIMPLE_PINHOLE',
+                1: 'PINHOLE',
+                2: 'SIMPLE_RADIAL',
+                3: 'RADIAL',
+                4: 'OPENCV',
+                5: 'OPENCV_FISHEYE',
+                6: 'FULL_OPENCV',
+                7: 'FOV',
+                8: 'SIMPLE_RADIAL_FISHEYE',
+                9: 'RADIAL_FISHEYE',
+                10: 'THIN_PRISM_FISHEYE'
+            }
+
+            with open(cameras_bin, 'rb') as f:
+                num_cameras = struct.unpack('Q', f.read(8))[0]
+
+                for _ in range(num_cameras):
+                    cam_id = struct.unpack('I', f.read(4))[0]
+                    model_id = struct.unpack('i', f.read(4))[0]
+                    width = struct.unpack('Q', f.read(8))[0]
+                    height = struct.unpack('Q', f.read(8))[0]
+
+                    model_name = CAMERA_MODEL_NAMES.get(model_id, f'MODEL_{model_id}')
+
+                    # Number of params depends on model
+                    num_params_map = {
+                        'SIMPLE_PINHOLE': 3,
+                        'PINHOLE': 4,
+                        'SIMPLE_RADIAL': 4,
+                        'RADIAL': 5,
+                        'OPENCV': 8,
+                        'OPENCV_FISHEYE': 8,
+                        'FULL_OPENCV': 12,
+                        'FOV': 5,
+                        'SIMPLE_RADIAL_FISHEYE': 4,
+                        'RADIAL_FISHEYE': 5,
+                        'THIN_PRISM_FISHEYE': 12
+                    }
+
+                    num_params = num_params_map.get(model_name, 8)  # default to 8
+                    params = struct.unpack(f'{num_params}d', f.read(8 * num_params))
+
+                    cameras[cam_id] = {
+                        'model': model_name,
+                        'width': int(width),
+                        'height': int(height),
+                        'params': list(params)
+                    }
+
+            logger.debug(f"Read {len(cameras)} cameras from binary")
+            return cameras
+
+        # Fallback to text format
+        elif cameras_txt.exists():
+            logger.debug(f"Reading COLMAP cameras (text): {cameras_txt}")
+            cameras = {}
+
+            with open(cameras_txt, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+
+                    parts = line.split()
+                    cam_id = int(parts[0])
+                    model = parts[1]
+                    width = int(parts[2])
+                    height = int(parts[3])
+                    params = [float(p) for p in parts[4:]]
+
+                    cameras[cam_id] = {
+                        'model': model,
+                        'width': width,
+                        'height': height,
+                        'params': params
+                    }
+
+            logger.debug(f"Read {len(cameras)} cameras from text")
+            return cameras
+
+        else:
+            raise FileNotFoundError(
+                f"COLMAP cameras file not found. Tried: {cameras_bin}, {cameras_txt}"
+            )
     
     def _read_images_txt(self, images_file: Path) -> Dict:
-        """Read COLMAP images.txt"""
-        images = {}
-        
-        if not images_file.exists():
-            raise FileNotFoundError(f"images.txt not found: {images_file}")
-        
-        with open(images_file, 'r') as f:
-            lines = f.readlines()
-        
-        i = 0
-        while i < len(lines):
-            line = lines[i].strip()
-            i += 1
-            
-            if not line or line.startswith('#'):
-                continue
-            
-            # Image line
-            parts = line.split()
-            img_id = int(parts[0])
-            qw, qx, qy, qz = map(float, parts[1:5])
-            tx, ty, tz = map(float, parts[5:8])
-            camera_id = int(parts[8])
-            name = parts[9]
-            
-            # Skip points2D line
-            if i < len(lines):
+        """
+        Read COLMAP images file (supports both .txt and .bin formats).
+
+        Args:
+            images_file: Path to images.txt (will also try images.bin)
+
+        Returns:
+            Dictionary of image data
+        """
+        import struct
+
+        # Try binary format first
+        images_bin = images_file.parent / 'images.bin'
+        images_txt = images_file
+
+        if images_bin.exists():
+            logger.debug(f"Reading COLMAP images (binary): {images_bin}")
+            images = {}
+
+            with open(images_bin, 'rb') as f:
+                num_images = struct.unpack('Q', f.read(8))[0]
+
+                for _ in range(num_images):
+                    img_id = struct.unpack('I', f.read(4))[0]
+
+                    # Quaternion (qw, qx, qy, qz)
+                    qvec = struct.unpack('dddd', f.read(32))
+
+                    # Translation (tx, ty, tz)
+                    tvec = struct.unpack('ddd', f.read(24))
+
+                    camera_id = struct.unpack('I', f.read(4))[0]
+
+                    # Image name (null-terminated string)
+                    name_chars = []
+                    while True:
+                        char = f.read(1)
+                        if char == b'\x00':
+                            break
+                        name_chars.append(char)
+                    name = b''.join(name_chars).decode('utf-8')
+
+                    # Skip points2D data
+                    num_points2D = struct.unpack('Q', f.read(8))[0]
+                    # Each point2D: x, y (2 doubles) + point3D_id (uint64) = 24 bytes
+                    f.read(num_points2D * 24)
+
+                    images[img_id] = {
+                        'name': name,
+                        'camera_id': camera_id,
+                        'qvec': np.array(qvec),
+                        'tvec': np.array(tvec)
+                    }
+
+            logger.debug(f"Read {len(images)} images from binary")
+            return images
+
+        # Fallback to text format
+        elif images_txt.exists():
+            logger.debug(f"Reading COLMAP images (text): {images_txt}")
+            images = {}
+
+            with open(images_txt, 'r') as f:
+                lines = f.readlines()
+
+            i = 0
+            while i < len(lines):
+                line = lines[i].strip()
                 i += 1
-            
-            images[img_id] = {
-                'name': name,
-                'camera_id': camera_id,
-                'qvec': np.array([qw, qx, qy, qz]),
-                'tvec': np.array([tx, ty, tz])
-            }
-        
-        logger.debug(f"Read {len(images)} images")
-        return images
+
+                if not line or line.startswith('#'):
+                    continue
+
+                # Image line
+                parts = line.split()
+                img_id = int(parts[0])
+                qw, qx, qy, qz = map(float, parts[1:5])
+                tx, ty, tz = map(float, parts[5:8])
+                camera_id = int(parts[8])
+                name = parts[9]
+
+                # Skip points2D line
+                if i < len(lines):
+                    i += 1
+
+                images[img_id] = {
+                    'name': name,
+                    'camera_id': camera_id,
+                    'qvec': np.array([qw, qx, qy, qz]),
+                    'tvec': np.array([tx, ty, tz])
+                }
+
+            logger.debug(f"Read {len(images)} images from text")
+            return images
+
+        else:
+            raise FileNotFoundError(
+                f"COLMAP images file not found. Tried: {images_bin}, {images_txt}"
+            )
     
     def _qvec_to_rotmat(self, qvec: np.ndarray) -> np.ndarray:
         """Convert quaternion to rotation matrix"""

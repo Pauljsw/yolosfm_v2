@@ -1,0 +1,50 @@
+# Local extraction tools (not for repository)
+extract_extrinsic.cpp
+extract_extrinsic.py
+extract_extrinsic
+CMakeLists_extract.txt
+build_extract/
+test_invert_extrinsic.py
+debug_*.py
+debug_*.png
+
+# Calibration files (camera-specific, not for repository)
+calib/*.json
+calib/*.txt
+calib/*_sdk.json
+calib/extrinsic_*.json
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data and outputs (large files)
+data/
+outputs/
+output_*/
+*.bag
+*.ply
+*.pcd
+
+# Temporary files
+*.tmp
+*.log
